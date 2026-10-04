@@ -8,6 +8,9 @@ Welcome to leave better suggestions under the videos:
 - [我好像让纸片人「活」过来了【邻舍.EXE-1.0】- bilibili 详细演示以及安装视频](https://www.bilibili.com/video/BV1uH7q6vEQ9/)
 - [【邻舍 2.0】😈既然是在本地AI生成，那凑成什么CP可就随我说了算了](https://www.bilibili.com/video/BV1wsNu61EX6/?share_source=copy_web&vd_source=e0c34a0021e0589a3fbdd4084f0a1b27)
 
+> [!NOTE]
+> **This repository is a personal enhancement fork of [邻舍.EXE](https://github.com/icecranberry/galgame-with-comfyUI)**: it continues from upstream v3.6.0 (2026-09-30) and is currently at **v3.6.3**, adding a living town ecosystem, a touch action system, a hypnosis phone, program time control, data backup, and more — see "🧩 New in This Fork" below. Descriptions of the original upstream features are kept unchanged.
+
 ---
 
 ## 💡 One-Sentence Introduction
@@ -15,6 +18,59 @@ Welcome to leave better suggestions under the videos:
 邻舍.EXE is a Galgame-inspired AI character companion app. Users can create characters with independent personalities, emotions, memories, and life rhythms; chat with them, and keep interacting through Moments, mailbox, schedules, group chats, and random events. Characters can also proactively call ComfyUI to generate images based on the conversation and current scene, naturally extending text conversations into visual experiences.
 
 The problem it wants to solve is simple: ordinary AI chatbots mostly just "answer questions", while 邻舍.EXE wants characters to feel like people who keep living their lives.
+
+## 🧩 New in This Fork
+
+The following features were added in this fork on top of upstream v3.6.0 (as of v3.6.3). Original upstream features are described in the sections below:
+
+### 🏙️ Living Town Ecosystem
+
+The town has grown from "a map + dialogue" into an ecosystem that runs on its own: residents with needs, personalities, and moods eat, work, spend, and socialize by themselves; shops need restocking, supply, and staffing, while coins flow through the economy; social relationships and shared experiences keep accumulating. The town keeps moving while you are away — come back and see what happened. **The town lives on even with the LLM turned off**; with the LLM on, a few key moments get dialogue and stories with real character flavor. Instead of step-by-step panels, you join the residents' lives through adventure choices — visiting shops, accepting invitations, getting caught up in town events.
+
+### 📱 Hypnosis Phone & Sleep Control
+
+- A "hypnosis phone" built into the chat page: deep hypnosis (will suppressed, reactions follow your explicit priorities), will-only wake (fully conscious but physically restrained), forgetting and forgetting logs; in group chats, target one person for the full panel or command several at once with per-person responses.
+- Sleep control: put a character to sleep or wake her anytime, with live status and estimated wake time; messages sent while she sleeps are queued until she wakes (you may first get a sleepy mumble).
+- Dream wake: triggering the special command while she sleeps opens a 5-minute temporary wake window with dedicated "dragged out of deep sleep" reactions.
+
+### ⏰ Program Time
+
+Fast-forward the in-game "now" from Settings: "+N days" (1–3650, all characters live through them together), switch day/night, jump to an exact date and time, or snap back to real time. Every character's schedule and sleep checks, the day/night phase, time labels in prompts, and the dates shown on the schedule page and in town all follow along.
+
+### ✋ Touch Action System
+
+- A floating panel with 25 actions across four tiers (daily / intimate / sensitive / private): draggable, with a badge showing how many actions still await her response, and it stays open for repeated taps.
+- She has her own tolerance and preferences: repeating the same action in a short time makes her impatient, cards are tagged with likes/dislikes, and when affection is too low she refuses you with an in-story line instead of an error.
+- With "instant reactions" on, each tap gets its own reply right away; with it off, reactions fold into your next message to save quota.
+- Group chats support bystander interjections (adjustable chance) and a sensitive-tier switch; actions can auto-generate images via an always/smart/never policy; the character detail page has a full stats panel (counts, tier distribution, preferences, tolerance, images generated).
+- Standing-portrait touch: interact directly on a character's standing portrait window with ripple effects and dedicated lines, customizable in the portrait manager.
+
+### 💞 Intimacy System & Dashboard
+
+The intimacy section in character details: keeps a running record of intimate acts and levels, with AI-based act detection per round, manual backfill for recent rounds, a daily detection limit, AI polishing, and automatic recording — an evolving intimacy archive.
+
+### 🧸 Toy System
+
+Each toy is unlocked by a "key", and once worn it continuously affects the character's state at its intensity; reactions are written into the chat log and share the same affection/tolerance data as the touch system. Private chat and group chat each keep their own set.
+
+### 💾 Data Backup
+
+One-click export of all data as a `tar.gz` archive from Settings (optionally including the model config that contains API keys — keep key-bearing archives private), and one-click import to restore; a rollback backup is generated automatically before importing.
+
+### 📊 Context Usage Panel
+
+A capsule in the top-left corner shows live token usage and remaining context for the current session (ring progress + percentage), with a per-section breakdown and the window source; when it is nearly full you can manually trigger "compress context" (rolling summary + memory consolidation). Model entries can declare a context window, or the app probes it from the provider.
+
+### 💬 Group Chat & Conversation Quality
+
+- **Group ↔ private memory sync**: bidirectional, with hard per-person/per-section/total character budgets so the context never overflows.
+- **Anti-repetition & topic progression**: anti-wheel-spinning, anti-rumination, automatic constraint escalation on repeated phrasing, plus optional presence/frequency penalties — all at the prompt layer, no extra model calls.
+- Group album, group image pipeline, script protocol, and interjection enhancements.
+- Moments memory recall: when a character posts, she remembers shared experiences related to the topic.
+
+### 🧪 Engineering
+
+A new `e2e/` browser end-to-end acceptance suite (Playwright, covering real flows across all major modules) and 20+ design documents under `docs/` (town economy, touch system, hypnosis phone, data backup, memory upgrade, etc.).
 
 ## 🏠 Interface Overview
 
@@ -179,7 +235,7 @@ The backend calls LLMs through OpenAI-compatible protocols, and image generation
 
 ### More Than a Concept Prototype
 
-The project already has complete modules including character management, private chat, group chat, multi-set emoji packs, a backpack with items and daily chests, character standing portraits, memory, emotion, relationships, Moments, gallery, schedules, adventures, mailbox, notifications, themeable UI, a desktop launcher, and an Android shell. It can be used and iterated as a real application.
+The project already has complete modules including character management, private chat, group chat, multi-set emoji packs, a backpack with items and daily chests, character standing portraits, memory, emotion, relationships, Moments, gallery, schedules, adventures, mailbox, the living town ecosystem, the touch action system, the hypnosis phone, program time, notifications, themeable UI, a desktop launcher, and an Android shell. It can be used and iterated as a real application.
 
 [![Mobile view](https://github.com/user-attachments/assets/c8d86580-94a5-4822-96bf-4dc9e459f201)](https://github.com/user-attachments/assets/c8d86580-94a5-4822-96bf-4dc9e459f201)
 
@@ -252,9 +308,9 @@ Double-click **`邻舍.EXE.exe`**, configure the ComfyUI path in the launcher **
 Prerequisites: **Node.js ≥ 18**, **Python ≥ 3.10 (with venv)**, **Git**, ComfyUI on `:8188`, and an LLM API key.
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/icecranberry/galgame-with-comfyUI.git
-cd galgame-with-comfyUI
+# 1. Clone the repository (this fork)
+git clone https://github.com/Sting255/galgame-with-comfyUI-.git
+cd galgame-with-comfyUI-
 
 # 2. Install dependencies
 cd agent-core && npm install && cd ..
@@ -315,6 +371,8 @@ All configuration is edited in the web **Settings** page with hot reload, and au
 | ComfyUI | URL / Artist string / Resolution / TLS / Global LoRA / HiresFix refinement settings |
 | Workflow | base / turbo / hybrid modes and scene mapping |
 | Feature flags | Emotion / Memory / Proactive chat / Events / Schedule / Disturb mode / Group chat / Weather / Background concurrency, etc. |
+| Touch actions | Instant reactions / daily quota / action image policy / group bystander interjections & sensitive-tier switch / anti-repetition & topic progression / presence·frequency penalty |
+| Program time | Fast-forward N days / day-night switch / set exact date & time / back to real time |
 | Group chat | Temperature, memory summary interval |
 | User info | Nickname / Gender / Appearance / Persona |
 | Weather | City (empty for auto) |
@@ -343,6 +401,8 @@ All configuration is edited in the web **Settings** page with hot reload, and au
 │   └── download_model.py
 ├── launcher/            # 邻舍.EXE launcher (PySide6 + PyInstaller)
 ├── android-shell/       # Android WebView shell (LAN access / notifications / file upload)
+├── docs/                # Design documents (town / touch / hypnosis / backup / memory upgrade / design system, etc.)
+├── e2e/                 # Browser end-to-end acceptance (Playwright)
 ├── workflow/            # ComfyUI workflow templates & prompt rules
 ├── scripts/             # dev / stop / build / release / apk / tag scripts
 └── ecosystem.config.cjs # PM2 production config
