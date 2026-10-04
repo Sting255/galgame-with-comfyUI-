@@ -69,3 +69,9 @@ logs/
 /linshe-backup-*.tar.gz
 /linshe-backup-*.tar.gz.*
 
+# ── 超过 GitHub 100MB 硬限制的文件：只作为 Release 资产，不进仓库 ──
+# 这几个 git 本身拉不动（单文件 >100MB 会被服务端直接拒），哪怕用 LFS 也是几十上百 MB 的浪费。
+# 发布时随 Release 附件分发（上游也是这个口径：Release zip 里"内置向量模型"）。
+*.zip
+vector-service/models/
+vector-service/chroma_data/

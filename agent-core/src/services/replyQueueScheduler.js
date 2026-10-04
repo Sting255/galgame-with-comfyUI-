@@ -75,6 +75,21 @@ async function tick() {
     // 1. 日程分散刷新（每次 tick 最多 1 个角色）
     await maybeRefreshOneSchedule();
 
+    // 1.5 当天报纸的**补图**（2026-10-04 修）。
+    //
+    // 原来报纸只靠上面第 0 步那次 rollover 触发 —— 但 `runProgramDayRollover` 在
+    // **同一天会直接早返回**（programDayRollover.js:117 `if (!force && last === current) return`，
+    // 任务列表一个都不跑）⇒ 补图**一天只试一次**：当天缺了图就永远缺，
+    // 用户只能手动点「手动补发」或等第二天翻篇（真机就是"日报的图老是加载不出来"）。
+    //
+    // `maybeGenerateDailyNewspaper()` 对"今天已有报纸"走的分支正是 `maybeRefillTodayImages`，
+    // 内部自带 15 分钟冷却 + `refillingImages` 并发闸 + 幂等（前面 0 步的 rollover 也会调它，
+    // 但那天只会命中一次）⇒ 放在每次 tick 上**不会重复生成报纸**，只会补缺的图。
+    // 动态 import：与 rollover 同一理由（newspaperService 会拉起 LLM / 生图依赖，别拖慢启动）。
+    import('./newspaperService.js')
+      .then(mod => mod.maybeGenerateDailyNewspaper())
+      .catch(err => console.warn('[newspaper] tick 补图失败（已忽略）:', err?.message || err));
+
     // 2. 回复队列处理（每次 tick 最多 1 个角色）
     await processReplyQueue();
   } catch (err) {

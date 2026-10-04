@@ -1,7 +1,7 @@
 /**
  * 《邻舍日报》——小镇预告报纸
  *
- * 每天零点起（replyQueueScheduler 第一个调度 tick）触发生成一份"预告报纸"：
+ * 每天零点起（首次由程序日期翻篇触发）生成一份"预告报纸"：
  *   - 4~5 条今天"将要发生"的新闻（普通新闻 3~4 条 + 1 条绑定随机角色的特稿），
  *     由 LLM 依据 <world_setting> 演算，每条配一幅插画
  *   - 15% 概率出现一条"世界状态"（影响全镇所有人，当天生效）；
@@ -136,7 +136,15 @@ function dbCharacterBrief(characterId) {
   return getDb().prepare('SELECT id, display_name, avatar_path FROM characters WHERE id = ?').get(characterId) || null;
 }
 
-// ── 生成调度入口（replyQueueScheduler tick 调用；不阻塞 tick） ──
+// ── 生成调度入口 ──
+// 调用方（2026-10-04 校准 —— 原来这句写的是「replyQueueScheduler tick 调用」，
+// 但实测 tick 走的是 rollover，而 rollover 在**同一天会早返回**，等于一天只调一次；
+// 缺图因此永远补不上。现在 tick 里直调了一次，三个入口如下）：
+//   ① replyQueueScheduler.tick 的「1.5 补图」—— **每次 tick**都调（幂等 + 15 分钟冷却），
+//      负责"当天已有报纸但缺图"这条唯一需要反复重试的路；
+//   ② programDayRollover 的 daily_newspaper 任务 —— 只在**程序日期翻篇**时跑一次；
+//   ③ routes/newspaper.js 手动补发 / routes/time.js 调时 —— 用户显式触发。
+// 本函数自身幂等（报纸已存在就只走补图），所以三个入口重复调用是安全的。
 
 export function maybeGenerateDailyNewspaper(now = getProgramNow()) {
   if (now.getHours() < GENERATION_HOUR) return null;

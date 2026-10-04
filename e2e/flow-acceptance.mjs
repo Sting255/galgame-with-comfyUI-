@@ -9,7 +9,7 @@
  * 环境变量：
  *   FLOW_BASE      被测后端（默认 http://127.0.0.1:3199）
  *   FLOW_CHAR_ID   主角色（默认 6 = 纳西妲）
- *   FLOW_GROUP_ID  群（默认 2）
+ *   FLOW_GROUP_ID  群（**不指定就自动取库里的第一个群**；指定了才用指定的）
  *   FLOW_SKIP      逗号分隔要跳过的编号，如 "F3,F4"（生图慢时可跳过）
  *   FLOW_HEADLESS  0 显示浏览器（默认 1）
  *
@@ -23,7 +23,7 @@ import fs from 'node:fs'
 
 const BASE = process.env.FLOW_BASE || 'http://127.0.0.1:3199'
 const CHAR = Number(process.env.FLOW_CHAR_ID || 6)
-const GROUP = Number(process.env.FLOW_GROUP_ID || 2)
+let GROUP = Number(process.env.FLOW_GROUP_ID || 0)
 const SKIP = new Set((process.env.FLOW_SKIP || '').split(',').map((s) => s.trim()).filter(Boolean))
 const HEADLESS = process.env.FLOW_HEADLESS !== '0'
 /** 生图落盘目录（F7 用磁盘为准，因为 IMAGES_DIR 只改写入、不改静态服务，见下） */
@@ -51,6 +51,29 @@ const j = async (u, opt = {}) => {
  */
 const msgList = (resp) => (resp.body?.messages || (Array.isArray(resp.body) ? resp.body : []))
 const maxId = (list) => list.reduce((m, x) => Math.max(m, Number(x.id) || 0), 0)
+
+// 群 id 自动解析（2026-10-04 修）。
+//
+// 原来这里是硬编码默认 `2`。但那是**开发机上的群 id** —— 换一台机器、
+// 或者库里群 id 不是 2（实测用户库里的唯一群是 **6**），F2 就会打到一个不存在的群，
+// 报 400/404 变成一条 ❌，**看起来像"群聊坏了"，其实是脚本默认值不对**（我自己就被误导过一轮）。
+//
+// 现在的口径：`FLOW_GROUP_ID` 明确指定就用它；没指定就**问后端要第一个群**；
+// 一个群都没有就把 F2 加进 SKIP 并打印原因 —— 宁可显式跳过，也不要给一个骗人的红。
+if (!GROUP) {
+  try {
+    const g = await j('/api/groups')
+    const first = Number((g.body?.groups || g.body || [])[0]?.id || 0)
+    if (first) {
+      GROUP = first
+      console.log(`[群] FLOW_GROUP_ID 未指定 ⇒ 自动取第一个群 id=${GROUP}`)
+    }
+  } catch { /* 拿不到就留 0，下面会跳过并说明 */ }
+}
+if (!GROUP) {
+  SKIP.add('F2')
+  console.log('[群] 库里一个群都没有 ⇒ 自动跳过 F2（不是失败）')
+}
 
 console.log(`被测后端 = ${BASE} | 角色 = ${CHAR} | 群 = ${GROUP} | 跳过 = ${[...SKIP].join(',') || '无'}`)
 console.log(`生图目录 = ${IMAGES_DIR || '（未设 IMAGES_DIR，按仓库 data/images）'}\n`)
