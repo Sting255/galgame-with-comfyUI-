@@ -794,7 +794,7 @@ async function main() {
 
   // shallow clone 保留 .git/
   log("创建 shallow clone (保留 .git 用于版本更新)...");
-  const GITHUB_REPO_URL = "https://github.com/icecranberry/galgame-with-comfyUI.git";
+  const GITHUB_REPO_URL = "https://github.com/Sting255/galgame-with-comfyUI-.git";
   // depth=50 覆盖足够历史，确保用户端 git describe / checkout tag 不出问题
   const cloneResult = await exec("git", ["clone", "--depth", "50", ROOT, RELEASE_DIR]);
   let hasGit = cloneResult.ok;
