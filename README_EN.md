@@ -9,7 +9,7 @@ Welcome to leave better suggestions under the videos:
 - [【邻舍 2.0】😈既然是在本地AI生成，那凑成什么CP可就随我说了算了](https://www.bilibili.com/video/BV1wsNu61EX6/?share_source=copy_web&vd_source=e0c34a0021e0589a3fbdd4084f0a1b27)
 
 > [!NOTE]
-> **This repository is a personal enhancement fork of [邻舍.EXE](https://github.com/icecranberry/galgame-with-comfyUI)**: it continues from upstream v3.6.0 (2026-09-30) and is currently at **v3.6.3**, adding a living town ecosystem, a touch action system, a hypnosis phone, program time control, data backup, and more — see "🧩 New in This Fork" below. Descriptions of the original upstream features are kept unchanged.
+> **This repository is a personal enhancement fork of [邻舍.EXE](https://github.com/icecranberry/galgame-with-comfyUI)**: it continues from upstream v3.6.0 (2026-09-30) and is currently at **v3.6.3**, adding a touch action system, a hypnosis phone, program time control, data backup, and more — see "🧩 New in This Fork" below. Descriptions of the original upstream features are kept unchanged.
 
 ---
 
@@ -22,10 +22,6 @@ The problem it wants to solve is simple: ordinary AI chatbots mostly just "answe
 ## 🧩 New in This Fork
 
 The following features were added in this fork on top of upstream v3.6.0 (as of v3.6.3). Original upstream features are described in the sections below:
-
-### 🏙️ Living Town Ecosystem
-
-The town has grown from "a map + dialogue" into an ecosystem that runs on its own: residents with needs, personalities, and moods eat, work, spend, and socialize by themselves; shops need restocking, supply, and staffing, while coins flow through the economy; social relationships and shared experiences keep accumulating. The town keeps moving while you are away — come back and see what happened. **The town lives on even with the LLM turned off**; with the LLM on, a few key moments get dialogue and stories with real character flavor. Instead of step-by-step panels, you join the residents' lives through adventure choices — visiting shops, accepting invitations, getting caught up in town events.
 
 ### 📱 Hypnosis Phone & Sleep Control
 
