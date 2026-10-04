@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>亲密看板 · 浏览器回归样例</title>
+<style id="fixture-style">
+/* 浏览器回归样例（非产品代码）：本页挂载真实 IntimatePanel.vue，
+   所以这里只有样例自己的外壳样式（工具条 / 结果区 / 面板容器 / 360px 窄屏容器），
+   面板本身的结构与皮肤全部由组件 scoped CSS 提供，不再复刻一份。
+   色值一律引用 tokens.css 里真实存在的 token，暖色 / 暗夜两套主题自动联动。 */
+html, body { margin: 0; padding: 0; }
+body {
+  box-sizing: border-box;
+  padding: 16px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: var(--fs-base);
+  line-height: 1.55;
+}
+h1 { margin: 0 0 6px; font-size: var(--fs-xl); }
+.sim-hint { max-width: 980px; margin: 0 0 10px; font-size: var(--fs-sm); color: var(--text-secondary); }
+.sim-hint b { color: var(--accent); font-weight: 700; }
+
+/* 样例工具条按钮：工具条属于样例自身，故用原生 button + token 皮肤；
+   产品侧按钮一律走 LinsheButton，面板内部（真实组件渲染出来的）也都是 LinsheButton。 */
+.sim-toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.sim-btn {
+  padding: 6px 12px;
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  box-shadow: 0 2px 0 var(--tint-subtle);
+  cursor: pointer;
+  transition: background-color 0.3s var(--ease-standard), border-color 0.3s var(--ease-standard);
+}
+.sim-btn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
+.sim-btn.is-active { color: var(--on-accent); background: var(--accent); border-color: var(--accent-hover); }
+
+#result {
+  max-width: 980px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: var(--fs-xs);
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+#board { max-width: 980px; }
+/* 面板容器：暖色＝暖纸外壳（与组件里的白色区块形成层级），暗夜＝深色玻璃 */
+.sim-panel-shell {
+  max-width: 780px;
+  padding: 14px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+}
+
+/* ── 窄屏模拟容器：真实 360px 视口（iframe），媒体查询按它自身的宽度命中 ── */
+#previews { display: flex; gap: 14px; align-items: flex-start; margin-top: 14px; }
+.sim-phone-wrap { display: block; }
+/* 收起时不用 display:none —— iframe 一旦脱离布局，视口宽度会塌成 0，媒体查询与测量都会失真 */
+.sim-phone-wrap.is-collapsed { height: 0; overflow: hidden; }
+.sim-phone-label { display: block; margin-bottom: 8px; font-size: var(--fs-xs); color: var(--text-secondary); }
+/* iframe 内的页面底色（iframe 里有完整样式表，但没有样例外壳的 body 内边距口径） */
+.sim-phone-body {
+  margin: 0;
+  padding: 10px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: var(--fs-base);
+  line-height: 1.55;
+}
+</style>
+</head>
+<body>
+<h1>亲密看板 · 浏览器回归样例</h1>
+<p class="sim-hint">
+  打开方式：启动 <b>npm --prefix web-ui run dev</b> 后访问 <b>/test/fixtures/intimatePanel.html</b>（加 <b>?theme=dark</b> 可直接以暗夜主题打开）。
+  用途：本页<b>直接挂载真实的 IntimatePanel.vue</b>（后端用 fetch 打桩，离线可跑、不连 3099），
+  自检组件漂移（六区块是否还在、组件 CSS 是否仍只用 token）、暖色·暗夜双主题的 token 溯源，
+  以及 360px 真实视口下的单列布局与横向溢出；结果见下方 PASS / FAIL 清单。
+</p>
+<div id="toolbar"></div>
+<pre id="result">Running…</pre>
+<div id="board"></div>
+<div id="previews"></div>
+<script type="module" src="./intimatePanel.js"></script>
+</body>
+</html>

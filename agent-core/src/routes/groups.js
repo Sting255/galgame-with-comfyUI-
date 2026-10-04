@@ -11,6 +11,7 @@
  * POST   /api/groups/:id/chat        用户发言 → SSE 流式返回本轮剧本
  */
 import { Router } from 'express';
+import { randomBytes } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -21,6 +22,7 @@ import {
   truncateRoundAfter, invalidateGroupTranscriptBoundary, isGroupPostProcessing,
 } from '../services/groupChatEngine.js';
 import { undoLastGroupRound } from '../services/groupRoundUndo.js';
+import { rollbackIntimateByRawIdRange } from '../services/intimateService.js';
 import { clearConversationMemories } from '../services/memory/memoryRepository.js';
 import { broadcast } from '../services/unifiedStreamBus.js';
 import { beginTurn } from '../services/llmTelemetry.js';
@@ -193,8 +195,11 @@ router.post('/:id/avatar', (req, res) => {
   }
 
   fs.mkdirSync(AVATARS_DIR, { recursive: true });
-  // 文件名带时间戳：/avatars 静态缓存 30 天，换头像必须换 URL
-  const filename = `group_${groupId}_${Date.now()}.png`;
+  // 文件名带时间戳：/avatars 静态缓存 30 天，换头像必须换 URL。
+  // 再拼 3 字节随机后缀：只靠 Date.now() 的毫秒分辨率**不足以**保证唯一——同一毫秒内两次上传会撞名，
+  // 那样下面 deleteGroupAvatarFile(旧路径) 删掉的正是刚写进去的新文件，库里却仍指向该路径，
+  // 群头像直接裂图（且坏 URL 还会被 /avatars 的 30 天缓存记住）。
+  const filename = `group_${groupId}_${Date.now()}_${randomBytes(3).toString('hex')}.png`;
   const base64Data = String(base64).replace(/^data:image\/\w+;base64,/, '');
   fs.writeFileSync(path.join(AVATARS_DIR, filename), Buffer.from(base64Data, 'base64'));
 
@@ -257,14 +262,23 @@ router.delete('/:id', (req, res, next) => {
       db.prepare(`DELETE FROM rolling_summaries WHERE conversation_id = ?`).run(conversationId);
       db.prepare(`DELETE FROM image_tasks WHERE conversation_id = ?`).run(conversationId);
       db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
+      // 亲密看板：解散群会把本群 raw 全部删掉，群聊流水必须在这之前同步回滚——
+      // 不回滚的话，成员在这次群聊里的行为会永远留在 character_intimate_log 里（记忆清了、看板降不回去）。
+      // 也不能用 clearIntimateData：那是按角色清空，会把成员私聊里的统计一起清掉。
+      // 传 conversationId 收敛区间：raw_messages.id 全库自增，本群 raw 不是连续段，只按 BETWEEN 会误删别的会话。
+      const rawBounds = db.prepare(
+        `SELECT MIN(id) AS minId, MAX(id) AS maxId FROM raw_messages WHERE conversation_id = ?`
+      ).get(conversationId);
+      const rolledBackIntimate = rollbackIntimateByRawIdRange(rawBounds?.minId, rawBounds?.maxId, { conversationId });
       db.prepare(`DELETE FROM raw_messages WHERE conversation_id = ?`).run(conversationId);
       db.prepare(`DELETE FROM group_chats WHERE id = ?`).run(groupId);
+      return rolledBackIntimate;
     });
-    transaction();
+    const rolledBackIntimate = transaction();
     // 群头像文件随群一起清掉，避免 data/avatars 里堆积孤儿图
     deleteGroupAvatarFile(group.avatar_path);
     invalidateGroupTranscriptBoundary(groupId);
-    res.json({ ok: true });
+    res.json({ ok: true, intimate: rolledBackIntimate });
   } catch (err) {
     next(err);
   }

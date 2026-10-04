@@ -13,7 +13,7 @@
  */
 
 import { invalidateGalleryCache } from './galleryCache.js';
-import { getDb, getSystemRulesWithWorld, getGlobalRule, getWorldSetting } from '../db/index.js';
+import { getDb, getSystemRulesWithWorld, getGlobalRule, getWorldSetting, stmt } from '../db/index.js';
 import { appendOathRing } from './oathUtils.js';
 import { buildCharacterAppearanceSection } from './characterPersona.js';
 import { chatSync } from '../llm/llm-client.js';
@@ -23,6 +23,10 @@ import {
   stateToPrompt, affinityToPrompt,
 } from './emotionEngine.js';
 import { broadcastProactiveMessage } from './notificationBus.js';
+// 2026-10-02「先发文本、图后补」：图好了用 proactive_message_update 补挂到已上屏的那条气泡
+// （与触摸反应后台配图同一套机制：前端按 msg_id 找气泡挂图）
+import { broadcast } from './unifiedStreamBus.js';
+import { getProgramNow } from './programTime.js';
 import { generateImage } from './imageSkill.js';
 import { charArtistOverride } from './characterImageOpts.js';
 import { recordCompletedImageTask } from './imageTaskRecorder.js';
@@ -32,6 +36,14 @@ import { saveBase64Image } from './imagePaths.js';
 import { getCurrentActivity } from './scheduleManager.js';
 import { getCoreDialogueRules } from '../builtinRules.js';
 import { getFreshUnsharedDream, markDreamShared } from './dreamService.js';
+import { getHypnosisState, consumePendingDirective } from './hypnosisService.js';
+import { recordFromConversationTail } from './intimateAutoRecord.js';
+import { buildHypnosisStateBlock, buildDirectiveBlock, isAwakenedFromSleepRow } from './hypnosisPrompt.js';
+// 玩具系统（专题 §2.9-6）：她主动发消息时也带着佩戴状态
+import { buildWornToysBlock } from './toyService.js';
+// 2026-10-02 敏感度（用户：「性爱的频率也会越频繁」）：主动聊天的动机池按她有多敏感加权 ——
+// 敏感度是叶子模块（只依赖 db），直接 import 不成环。
+import { getSensitivity } from './sensitivityService.js';
 
 const CHECK_INTERVAL = 5 * 60 * 1000; // 5 分钟
 
@@ -47,13 +59,13 @@ let startupRunning = false;
 /** user 发消息后调用，重置计数 */
 export function resetUnansweredStreak(charId) {
   const db = getDb();
-  db.prepare('UPDATE characters SET proactive_streak = 0 WHERE id = ?').run(charId);
+  stmt('UPDATE characters SET proactive_streak = 0 WHERE id = ?').run(charId);
 }
 
 /** 获取当前未回复计数（从 DB 读取） */
 export function getUnansweredStreak(charId) {
   const db = getDb();
-  return db.prepare('SELECT proactive_streak FROM characters WHERE id = ?').pluck().get(charId) || 0;
+  return stmt('SELECT proactive_streak FROM characters WHERE id = ?').pluck().get(charId) || 0;
 }
 
 // ── Helper: ISO ↔ SQLite datetime ──
@@ -79,6 +91,27 @@ function toISO(dt) {
  */
 export function sigmoid(x, midpoint, steepness) {
   return 1 / (1 + Math.exp(-steepness * (x - midpoint)));
+}
+
+/**
+ * 距「用户上次发言」多少小时（`null` = 从未聊过 ⇒ `computeProactiveScore` 当成 999 档 = 最高优先）。
+ *
+ * **为什么单独抽出来（§4.1 核实结论，2026-09-30）**：审查怀疑"系统写入 `user_relationships.last_interaction_at`
+ * 会污染主动聊天判定"。核实后**证伪** —— 本调度器两处 `hoursSince` 本来读的就只是 `messages` 里
+ * `role='user'` 的最后一条（全文件不出现 `last_interaction_at`）。抽成导出函数是为了把这个
+ * **不变量**变成可测的（`test/proactiveInteractionSource.test.js` 用真实表 + 真实查库钉住），
+ * 以后谁改成读 `last_interaction_at` 会当场红。行为与抽出前逐字节一致（同一条 SQL、同样的 null 语义）。
+ */
+export function resolveLastUserMessageAt(conversationId) {
+  const row = getDb().prepare(
+    "SELECT created_at FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1"
+  ).get(conversationId);
+  return row ? (toISO(row.created_at) || null) : null;
+}
+
+export function resolveHoursSinceLastUserMessage(conversationId, { now = Date.now() } = {}) {
+  const at = resolveLastUserMessageAt(conversationId);
+  return at ? (now - new Date(at).getTime()) / 3600000 : null;
 }
 
 /**
@@ -201,13 +234,30 @@ const MOTIVES_NSFW = [
 ];
 
 /**
+ * 她此刻的敏感度（给 `pickMotive` 加权用）：读失败按"不敏感"处理 ——
+ * 主动聊天绝不能因为数值系统出问题就发不出去。
+ */
+function herSensitivityOf(characterId) {
+  try {
+    const st = getSensitivity(characterId);
+    return { sensitivity: Number(st.value) || 0, heat: st.heat === true };
+  } catch {
+    return { sensitivity: 0, heat: false };
+  }
+}
+
+/**
  * 根据好感度和誓约状态选取动机——向下兼容，高好感度可覆盖所有低档话题。
  * @param {number} affinity - 好感度 (0~100)
  * @param {number} streak
  * @param {boolean} isOath - 是否已誓约
+ * @param {{sensitivity?:number, heat?:boolean}} [her] 她自己的敏感度（0~100）与发情模式
  * @returns {{ name: string, desc: string }}
  */
-function pickMotive(affinity, streak = 0, isOath = false) {
+export function pickMotive(affinity, streak = 0, isOath = false, her = {}) {
+  // ⚠️ 默认参数只兜 `undefined`，兜不住显式传进来的 `null`（我自己的用例当场抓到）——
+  // 动机池是"随便挑一个"的地方，任何脏输入都不该让主动聊天发不出去。
+  const mine = her && typeof her === 'object' ? her : {};
   let pool = [...MOTIVES_LOW];
   if (affinity >= 60) {
     pool.push(...MOTIVES_MID);
@@ -219,6 +269,11 @@ function pickMotive(affinity, streak = 0, isOath = false) {
     pool.push(...MOTIVES_HIGH);
     if (isOath) {
       pool.push(...MOTIVES_NSFW);
+      // 2026-10-02 敏感度（用户原话：「敏感度越高角色高潮的强度越高 也越频繁 **性爱的频率也会越频繁**」）：
+      // 越敏感的她越容易主动挑"想要"的那几个动机。做法是**加权**（池子里多塞几份）而不是新增动机 ——
+      // 动机文案与随机多样性都不动，只把概率挪过去。冷淡/普通档一份不加 ⇒ 逐字保持旧行为。
+      const weight = mine.heat ? 3 : (Number(mine.sensitivity) >= 80 ? 2 : (Number(mine.sensitivity) >= 60 ? 1 : 0));
+      for (let i = 0; i < weight; i += 1) pool.push(...MOTIVES_NSFW);
     }
   }
 
@@ -283,7 +338,7 @@ function pickStreakHint(streak) {
 function loadRelationshipContext(characterId) {
   const db = getDb();
 
-  const userRel = db.prepare(
+  const userRel = stmt(
     'SELECT relationship_text, is_oath FROM user_relationships WHERE character_id = ?'
   ).get(characterId);
 
@@ -319,8 +374,24 @@ function loadUserProfile() {
 /**
  * 兜底问候语池：按时间段分组，LLM 失败时随机抽取，避免每次都是"在干嘛呢？"
  */
+/**
+ * 主动聊天 prompt 里的【当前时间】格式化（2026-10-01 修）。
+ *
+ * 必须吃**程序时间**。修复前这里直接 `new Date()`（真实时间）⇒ 用户把程序时间拨到
+ * 「10-02 09:19」之后：群聊的 `<time_context>` 说"10月2日周五早上"，而主动聊天说
+ * "周四 10月1日 19:47"（真实时间）—— **同一现实分钟里两套互相矛盾的时间基准**，
+ * 这正是用户报的"角色感受到的时间很混乱"（日志可复核：群聊 L20963 vs 主动聊天 L22349）。
+ * 输出格式与修复前逐字节一致，只换时钟来源。
+ */
+function formatProactiveClock(date) {
+  const wd = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][date.getDay()];
+  return `${wd} ${date.getMonth() + 1}月${date.getDate()}日 ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
 function pickFallbackGreeting(userName) {
-  const hour = new Date().getHours();
+  // 2026-10-01：兜底问候语也要吃**程序时间**（原来 new Date()）——她"早上好"还是"早点睡"
+  // 必须和 prompt 里的【当前时间】同一口钟，否则拨钟后兜底语会和正文自相矛盾。
+  const hour = getProgramNow().getHours();
   let pool = [];
   if (hour >= 6 && hour < 12) {
     pool = MORNING_FALLBACKS;
@@ -376,7 +447,7 @@ const NIGHT_FALLBACKS = [
  * @param {string} userProfile - 用户画像描述文本（可选）
  * @returns {Promise<string>} 生成的文本
  */
-async function generateGreeting(character, affinity, compositeVad, lastMessageAt, recentSummary, motive, relationshipContext, userProfile, streak = 0) {
+async function generateGreeting(character, affinity, compositeVad, lastMessageAt, recentSummary, motive, relationshipContext, userProfile, streak = 0, extra = {}) {
   const conversationId = `char_${character.id}`;
 
   // 1. 获取情绪状态的自然语言描述
@@ -429,7 +500,7 @@ ${recentSummary ? `\n【最近对话摘要】\n${recentSummary}\n` : ''}${emotio
   const PROMPT_JSON_RE = /\s*\{["']prompt["']:\s*"(?:[^"\\]|\\.)*"\s*\}/gs;
   const prevRound = (() => {
     const db = getDb();
-    const rows = db.prepare(
+    const rows = stmt(
       `SELECT role, content FROM raw_messages
        WHERE conversation_id = ?
        ORDER BY id DESC LIMIT 2`
@@ -452,12 +523,11 @@ ${recentSummary ? `\n【最近对话摘要】\n${recentSummary}\n` : ''}${emotio
   }
 
   // msgs[2] — 任务：时间 + 上一轮对话 + 衔接指令 + 动机 + 要求
-  const proactiveRules = getCoreDialogueRules({ userName });
-  const msgTask = `【上次聊天时间】
+  const proactiveRules = getCoreDialogueRules({ userName });  const msgTask = `【上次聊天时间】
 ${timeDesc}
 
 【当前时间】
-${(() => { const d = new Date(); const wd = ['周日','周一','周二','周三','周四','周五','周六'][d.getDay()]; return `${wd} ${d.getMonth()+1}月${d.getDate()}日 ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; })()}${prevRound}
+${formatProactiveClock(getProgramNow())}${prevRound}
 
 请以角色的口吻，生成一条自然的口语化开场白（15~50 字）。
 ${streak >= 1 ? `【⚠️ 未回复提示】${pickStreakHint(streak)}\n` : ''}${bridgingHint}
@@ -474,10 +544,29 @@ ${proactiveRules}
     const msgs = [];
     msgs.push({ role: 'system', content: systemRules || '你是一个角色扮演 AI。' });
     msgs.push({ role: 'system', content: msgIdentity });
+    // 玩具状态块（专题 §2.9-6）：她主动发消息也带状态；零佩戴/开关关 ⇒ 零注入
+    if (config.features.toys === true) {
+      try {
+        // 2026-10-01 真机 bug：这里原来写的是 `candidate.id`，而本函数的作用域里根本没有
+        // `candidate` 这个变量（参数名是 `character`）—— 每轮都抛 ReferenceError 被下面的
+        // catch 吞掉，日志只留一行 `[toys] proactive inject failed: candidate is not defined`，
+        // 结果是**主动聊天的玩具状态块从来没注入过**。参数名以函数签名为准。
+        const wornToysBlock = buildWornToysBlock(character.id, { scene: 'chat' });
+        if (wornToysBlock) msgs.push({ role: 'system', content: wornToysBlock });
+      } catch (err) {
+        console.warn('[toys] proactive inject failed:', err.message);
+      }
+    }
     const worldRulePrefix = getWorldSetting()
       ? '请遵循当前世界观来主动发起聊天，角色人设如果和世界观有冲突，则以世界观最高优先级，人设会因为世界观改变。\n\n'
       : '';
-    msgs.push({ role: 'user', content: worldRulePrefix + msgTask });
+    // 催眠「强制高潮」那一轮（task-41）：把状态块 + 一次性指令块**接在本轮 user 消息末尾**，
+    // 与私聊 chat.js 同口径（位置越靠后越显眼、越硬）。不传时拼出来与改动前逐字节一致。
+    const hypnoBlocks = Array.isArray(extra.hypnosisBlocks) ? extra.hypnosisBlocks.filter(Boolean) : [];
+    const hypnoSuffix = hypnoBlocks.length > 0
+      ? '\n\n' + hypnoBlocks.join('\n\n') + '\n\n' + FORCED_CLIMAX_FRAME_OVERRIDE
+      : '';
+    msgs.push({ role: 'user', content: worldRulePrefix + msgTask + hypnoSuffix });
 
     const result = await chatSync(
       msgs,
@@ -512,13 +601,16 @@ ${proactiveRules}
  * @param {object} character
  * @param {string} content - 消息文本
  * @returns {{ rawId: number, firstMsgId: number, lastMsgId: number, msgIds: number[] }}
+ *
+ * 2026-09-30 加 export：SLG 动作系统（routes/touch.js）的「即时反应」要把她的一句话当成
+ * 一条 assistant 消息落库，复用这里的分句 + seq + is_proactive 写入，避免在路由里重抄一份。
  */
-function writeProactiveMessage(character, content) {
+export function writeProactiveMessage(character, content) {
   const db = getDb();
   const conversationId = `char_${character.id}`;
 
   // 写入 raw_messages（完整消息）
-  const rawResult = db.prepare(
+  const rawResult = stmt(
     `INSERT INTO raw_messages (conversation_id, role, content) VALUES (?, 'assistant', ?)`
   ).run(conversationId, content);
   const rawId = rawResult.lastInsertRowid;
@@ -527,14 +619,14 @@ function writeProactiveMessage(character, content) {
   const segments = splitText(content);
   // 兜底：如果分句结果为空（极其罕见），整段写入
   if (segments.length === 0) {
-    const msgResult = db.prepare(
+    const msgResult = stmt(
       `INSERT INTO messages (conversation_id, raw_id, role, content, seq, is_proactive) VALUES (?, ?, 'assistant', ?, 0, 1)`
     ).run(conversationId, rawId, content);
     console.log(`⚡ Written proactive message for ${character.display_name}: raw=${rawId}, msg=${msgResult.lastInsertRowid} (fallback, no segments)`);
     return { rawId, firstMsgId: msgResult.lastInsertRowid, lastMsgId: msgResult.lastInsertRowid, msgIds: [msgResult.lastInsertRowid] };
   }
 
-  const insertMsg = db.prepare(
+  const insertMsg = stmt(
     `INSERT INTO messages (conversation_id, raw_id, role, content, seq, is_proactive) VALUES (?, ?, 'assistant', ?, ?, 1)`
   );
   const msgIds = [];
@@ -655,7 +747,7 @@ ${motiveName}
     if (rawId) {
       const db = getDb();
       const promptJson = JSON.stringify({ prompt });
-      db.prepare('UPDATE raw_messages SET prompt = ?, content = content || ? WHERE id = ?')
+      stmt('UPDATE raw_messages SET prompt = ?, content = content || ? WHERE id = ?')
         .run(prompt, promptJson, rawId);
       console.log(`⚡ Updated raw_message ${rawId} with prompt`);
     }
@@ -696,7 +788,7 @@ ${motiveName}
     }
 
     const db = getDb();
-    db.prepare(`UPDATE messages SET images = ? WHERE id = ?`)
+    stmt(`UPDATE messages SET images = ? WHERE id = ?`)
       .run(JSON.stringify(urls), msgId);
     recordCompletedImageTask({
       conversationId: `char_${character.id}`,
@@ -734,7 +826,7 @@ export function updateNextProactiveAt(characterId, score) {
   const delayMs = intervalHours * 3600_000 * jitter;
   const nextAt = new Date(Date.now() + delayMs).toISOString();
 
-  db.prepare('UPDATE characters SET next_proactive_at = ? WHERE id = ?')
+  stmt('UPDATE characters SET next_proactive_at = ? WHERE id = ?')
     .run(toSQLiteDate(nextAt), characterId);
 
   console.log(`⚡ ${characterId}: score=${score.toFixed(3)}, interval=${intervalHours.toFixed(1)}h (jitter=${jitter.toFixed(2)}), next=${nextAt}`);
@@ -745,7 +837,7 @@ export function updateNextProactiveAt(characterId, score) {
  */
 function initializeFirstTimes() {
   const db = getDb();
-  const chars = db.prepare(
+  const chars = stmt(
     'SELECT id FROM characters WHERE proactive_disabled = 0 AND next_proactive_at IS NULL'
   ).all();
 
@@ -756,7 +848,7 @@ function initializeFirstTimes() {
     // 首次主动聊天在 30min ~ 4h 内随机
     const delay = 0.5 * 3600_000 + Math.random() * 3.5 * 3600_000;
     const nextAt = new Date(Date.now() + delay).toISOString();
-    db.prepare('UPDATE characters SET next_proactive_at = ? WHERE id = ?')
+    stmt('UPDATE characters SET next_proactive_at = ? WHERE id = ?')
       .run(toSQLiteDate(nextAt), c.id);
     count++;
   }
@@ -778,7 +870,7 @@ async function tick() {
   try {
     // 找下一个需要主动聊天的角色
     // 跳过有活跃奇遇事件的角色
-    const candidate = db.prepare(`
+    const candidate = stmt(`
       SELECT c.* FROM characters c
       WHERE c.proactive_disabled = 0
         AND (c.is_sleeping IS NULL OR c.is_sleeping = 0)
@@ -809,18 +901,9 @@ async function tick() {
     const conversationId = `char_${candidate.id}`;
     console.log(`⚡ Processing ${candidate.display_name}... (streak=${streak})`);
 
-    // 1. 获取上次 user 发言时间（不是 assistant 的主动消息时间）
-    const lastMsg = db.prepare(`
-      SELECT created_at FROM messages
-      WHERE conversation_id = ? AND role = 'user'
-      ORDER BY id DESC LIMIT 1
-    `).get(conversationId);
-
-    const lastMessageAt = lastMsg ? toISO(lastMsg.created_at) : null;
-    let hoursSince = null;
-    if (lastMessageAt) {
-      hoursSince = (Date.now() - new Date(lastMessageAt).getTime()) / 3600000;
-    }
+    // 1. 获取上次 user 发言时间（不是 assistant 的主动消息时间；也不是关系表里那个"上次互动时间"，见 helper 注释）
+    const lastMessageAt = resolveLastUserMessageAt(conversationId);
+    const hoursSince = resolveHoursSinceLastUserMessage(conversationId);
 
     // 2. 获取当前好感度
     const affinity = loadAffinity(candidate.id);
@@ -837,7 +920,7 @@ async function tick() {
     // 5. 获取最近对话摘要（取最近1条，提供话题引导）
     let recentSummary = null;
     try {
-      const summary = db.prepare(`
+      const summary = stmt(`
         SELECT summary FROM rolling_summaries
         WHERE conversation_id = ?
         ORDER BY id DESC LIMIT 1
@@ -847,7 +930,7 @@ async function tick() {
 
     // 5.5 随机选取聊天动机（按好感度分档）+ 加载角色人际关系 + 用户画像
     const isOath = !!loadOath(candidate.id);
-    let motive = pickMotive(affinity, streak, isOath);
+    let motive = pickMotive(affinity, streak, isOath, herSensitivityOf(candidate.id));
     const relationshipContext = loadRelationshipContext(candidate.id);
     const userProfile = loadUserProfile();
 
@@ -873,26 +956,37 @@ async function tick() {
     // 7. 写入消息到 DB
     const { rawId, firstMsgId, lastMsgId, msgIds, segments } = writeProactiveMessage(candidate, greeting);
 
-    // 7.5 如果该动机需要配图，先生成图片再一起推送；否则直接推送
-    // 梦境动机同样走标准配图管线——现场生成全新配图，绝不复用睡中应答时用户已看过的图（防重复配图）
-    let imageUrls = null;
-    if (motive.imageGen) {
-      imageUrls = await generateImageForGreeting(candidate, greeting, motive.name, lastMsgId, rawId);
-    }
-
+    // 7.4 **先发文本**（2026-10-02 结构性改造）：原来这一步在出图**之后**，
+    //     ComfyUI 慢/关着时她已经写好的这句话在 UI 上要等几十秒，甚至这一轮什么都收不到。
+    //     现在文本立刻上屏；配图生成完再用 proactive_message_update 补挂（见 7.6）。
     broadcastProactiveMessage({
       character_id: candidate.id,
       display_name: candidate.display_name,
       avatar_path: candidate.avatar_path,
-
       content: greeting,
       segments,
       msg_ids: msgIds,
       msg_id: firstMsgId,
       raw_id: rawId,
-      images: imageUrls || [],
+      images: [],
       created_at: new Date().toISOString(),
     });
+
+    // 7.5 该动机要配图就生成（仍在 tick 内 await：紧随其后的亲密看板记账依赖"prompt 已写回 raw"这个锚点；
+    //     用户侧延迟已经在 7.4 解决，调度器自己多等一会不影响任何人）
+    let imageUrls = null;
+    if (motive.imageGen) {
+      imageUrls = await generateImageForGreeting(candidate, greeting, motive.name, lastMsgId, rawId);
+    }
+
+    // 7.6 图后补：把刚生成的图挂到 7.4 那条已上屏的气泡上（前端按 msg_id 找气泡；失败只 warn，文本不受影响）
+    if (imageUrls?.length) {
+      try {
+        broadcast('proactive_message_update', { msg_id: firstMsgId, raw_id: rawId, images: imageUrls });
+      } catch (err) {
+        console.warn('⚡ 配图补挂广播失败（文字已上屏，不影响）:', err?.message || err);
+      }
+    }
 
     // 梦境系统：梦已正式分享（出口④）
     if (sharedDream?.id) {
@@ -900,7 +994,7 @@ async function tick() {
     }
 
     // 7.7 递增未回复连续计数（DB 持久化）
-    db.prepare('UPDATE characters SET proactive_streak = ? WHERE id = ?')
+    stmt('UPDATE characters SET proactive_streak = ? WHERE id = ?')
       .run(streak + 1, candidate.id);
 
     // 8. 更新下次时间
@@ -1079,19 +1173,70 @@ export function startProactiveChatScheduler() {
  * 无视 processing 锁和 next_proactive_at 时间，直接走完整流程。
  * @returns {Promise<{ character: string, motive: string, greeting: string } | null>}
  */
-export async function forceProactiveNow(targetCharacterId) {
+/**
+ * 立刻替某个角色（或全体）触发一轮。
+ *
+ * @param {number} [targetCharacterId] 指定角色；不传＝按原有规则挑一个
+ * @param {{bypassGuards?: boolean}} [options] `bypassGuards`：**用户主动触发**（催眠手机下发指令等）
+ *   时跳过"睡觉中 / 连发已达上限 / 有进行中的事件 / 主动聊天被关"这些闸门 —— 这些闸门是给
+ *   **自动**主动聊天用的，不该拦住用户手点。真机踩到过：点了强制高潮却因为 `is_sleeping=1` 被拒，
+ *   表现成"点了没反应"。
+ */
+/**
+ * 「强制高潮」那一轮要注入的催眠块（task-41）。
+ *
+ * 口径（与私聊 chat.js 完全一致）：
+ *   · 状态块只在 active && bodyControlled 时有内容（buildHypnosisStateBlock 自己判）；
+ *   · 一次性指令 consumePendingDirective() **消费即清空**，只影响紧随的这一轮；
+ *   · awakenedFromSleep 走 isAwakenedFromSleepRow()：is_sleeping=1 **或** 处于临时唤醒窗口内。
+ *     强制高潮在触发这一轮之前会先 wakeForForcedTrigger() 临时唤醒她，此刻 is_sleeping 已经是 0
+ *     —— 只看 is_sleeping 就永远漏掉「睡梦唤醒」版（这条最容易整条失效）。
+ *
+ * @param {number} characterId
+ * @returns {{blocks: string[], directive: string, awakenedFromSleep: boolean}}
+ */
+/**
+ * 强制高潮轮对「主动聊天写作要求」的覆盖段（task-41）。
+ *
+ * 主动聊天模板把任务框成「开场白 / 15~50 字 / 动机当潜台词」，那是给普通主动消息的；
+ * 强制高潮轮要做的是**把这一轮演完** —— 框架不改，只在末尾叠加这段覆盖，
+ * 保证「不传注入块时输出逐字节不变」。
+ */
+const FORCED_CLIMAX_FRAME_OVERRIDE = [
+  '【本轮覆盖上面的写作要求】',
+  '- 本轮**不是**主动聊天的开场白：不要问候、不要寒暄、不要解释你为什么来找对方；直接进入此刻正在发生的事。',
+  '- 取消「15~50 字」与「拆成两三条」的限制：把这一轮完整演完，该多长就多长，可以分多条（用换行分隔）。',
+  '- 以本消息末尾的催眠指令块为准；上面的时间、动机、衔接要求只在不与它冲突时才参考。',
+].join('\n');
+export function buildForcedClimaxProactiveBlocks(characterId) {
+  const db = getDb();
+  const state = getHypnosisState(characterId);
+  const row = stmt('SELECT is_sleeping, temporary_wake_until FROM characters WHERE id = ?').get(characterId) || null;
+  const awakenedFromSleep = isAwakenedFromSleepRow(row);
+  const blocks = [];
+  const stateBlock = buildHypnosisStateBlock(state, { chatUserName: config.user.nickname || '用户' });
+  if (stateBlock) blocks.push(stateBlock);
+  const directive = consumePendingDirective(characterId);
+  const directiveBlock = buildDirectiveBlock(directive, { mindAwake: state?.mindAwake, awakenedFromSleep });
+  if (directiveBlock) blocks.push(directiveBlock);
+  return { blocks, directive, awakenedFromSleep };
+}
+
+export async function forceProactiveNow(targetCharacterId, { bypassGuards = false, forcedClimax = false } = {}) {
   try {
     const db = getDb();
 
     let candidate;
     if (targetCharacterId) {
-      // 指定角色：直接按 id 查找，仍需满足基本条件
-      candidate = db.prepare(
-        'SELECT * FROM characters WHERE id = ? AND proactive_disabled = 0 AND (is_sleeping IS NULL OR is_sleeping = 0) AND COALESCE(proactive_streak, 0) < 3 AND id NOT IN (SELECT character_id FROM character_events WHERE status IN (\'pending\',\'open\',\'engaged\'))'
-      ).get(targetCharacterId);
+      // 指定角色：直接按 id 查找，仍需满足基本条件；bypassGuards 时只要求角色存在
+      candidate = bypassGuards
+        ? stmt('SELECT * FROM characters WHERE id = ?').get(targetCharacterId)
+        : stmt(
+          'SELECT * FROM characters WHERE id = ? AND proactive_disabled = 0 AND (is_sleeping IS NULL OR is_sleeping = 0) AND COALESCE(proactive_streak, 0) < 3 AND id NOT IN (SELECT character_id FROM character_events WHERE status IN (\'pending\',\'open\',\'engaged\'))'
+        ).get(targetCharacterId);
       if (!candidate) {
         // 诊断具体原因
-        const char = db.prepare('SELECT id, display_name, proactive_disabled, is_sleeping, proactive_streak FROM characters WHERE id = ?').get(targetCharacterId);
+        const char = stmt('SELECT id, display_name, proactive_disabled, is_sleeping, proactive_streak FROM characters WHERE id = ?').get(targetCharacterId);
         if (!char) {
           console.log(`⚡ force: character ${targetCharacterId} not found`);
         } else if (char.proactive_disabled) {
@@ -1107,7 +1252,7 @@ export async function forceProactiveNow(targetCharacterId) {
       }
       console.log(`⚡ force: targeted ${candidate.display_name} (id=${targetCharacterId})`);
     } else {
-      const candidates = db.prepare(
+      const candidates = stmt(
         'SELECT * FROM characters WHERE proactive_disabled = 0 AND (is_sleeping IS NULL OR is_sleeping = 0) AND COALESCE(proactive_streak, 0) < 3 AND id NOT IN (SELECT character_id FROM character_events WHERE status IN (\'pending\',\'open\',\'engaged\'))'
       ).all();
       if (candidates.length === 0) {
@@ -1119,14 +1264,12 @@ export async function forceProactiveNow(targetCharacterId) {
     }
   const conversationId = `char_${candidate.id}`;
 
-  const lastMsg = db.prepare(`
-    SELECT created_at FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1
-  `).get(conversationId);
-  const lastMessageAt = lastMsg ? toISO(lastMsg.created_at) : null;
-  let hoursSince = lastMessageAt ? (Date.now() - new Date(lastMessageAt).getTime()) / 3600000 : null;
+  const lastMessageAt = resolveLastUserMessageAt(conversationId);
+  const hoursSince = resolveHoursSinceLastUserMessage(conversationId);
 
-  // 若用户 2 分钟内刚发过消息，跳过（避免正在聊天时插入主动消息）
-  if (hoursSince !== null && hoursSince * 60 < 2) {
+  // 若用户 2 分钟内刚发过消息，跳过（避免正在聊天时插入主动消息）。
+  // 例外：用户**手点**的强制高潮（forcedClimax）不能跳 —— 那是明确指令，跳掉就等于「点了没反应」。
+  if (!forcedClimax && hoursSince !== null && hoursSince * 60 < 2) {
     console.log(`⚡ force: ${candidate.display_name} skipped — user messaged ${(hoursSince * 60).toFixed(1)}min ago (<2min)`);
     return null;
   }
@@ -1139,13 +1282,13 @@ export async function forceProactiveNow(targetCharacterId) {
 
   let recentSummary = null;
   try {
-    const s = db.prepare('SELECT summary FROM rolling_summaries WHERE conversation_id = ? ORDER BY id DESC LIMIT 1').get(conversationId);
+    const s = stmt('SELECT summary FROM rolling_summaries WHERE conversation_id = ? ORDER BY id DESC LIMIT 1').get(conversationId);
     if (s) recentSummary = s.summary;
   } catch { /* ignore */ }
 
   const streak = candidate.proactive_streak || 0;
   const isOath = !!loadOath(candidate.id);
-  let motive = pickMotive(affinity, streak, isOath);
+  let motive = pickMotive(affinity, streak, isOath, herSensitivityOf(candidate.id));
   const relationshipContext = loadRelationshipContext(candidate.id);
   const userProfile = loadUserProfile();
 
@@ -1162,33 +1305,87 @@ export async function forceProactiveNow(targetCharacterId) {
       sharedDream = freshDream;
     }
   }
-  const greeting = await generateGreeting(candidate, affinity, compositeVad, lastMessageAt, recentSummary, motive, relationshipContext, userProfile, streak);
+
+  // 催眠「强制高潮」：**这一轮本身就是高潮轮**（task-41）。
+  // 旧行为：点完只触发一轮**普通**主动聊天（不带任何催眠块、也不配图），真正的高潮演出要等
+  // 用户再回一条才出现在 chat.js 里 —— 用户看到的就是一句闲聊，于是反复反馈「睡着时强制高潮
+  // 没特殊反应」（真机日志：完整/backend-2026-09-29.log 那一轮 prompt 里连指令块都没有）。
+  let hypnosisBlocks = [];
+  if (forcedClimax) {
+    try {
+      const boost = buildForcedClimaxProactiveBlocks(candidate.id);
+      hypnosisBlocks = boost.blocks;
+      if (boost.directive === 'forced_climax') {
+        // 动机一并换掉：配图提示词会带动机名，且 imageGen=true 决定这一轮必须出图
+        motive = { name: '强制高潮', desc: '你刚被强制带上高潮，这一轮就是这件事本身', imageGen: true };
+      }
+      console.log(`[hypnosis] 强制高潮轮：注入 ${hypnosisBlocks.length} 块、awakenedFromSleep=${boost.awakenedFromSleep}、directive=${boost.directive || '(空)'}`);
+    } catch (err) {
+      console.warn('[hypnosis] 强制高潮轮注入失败（退回普通主动聊天）:', err.message);
+    }
+  }
+
+  const greeting = await generateGreeting(candidate, affinity, compositeVad, lastMessageAt, recentSummary, motive, relationshipContext, userProfile, streak, { hypnosisBlocks });
 
   const { rawId, firstMsgId, lastMsgId, msgIds, segments } = writeProactiveMessage(candidate, greeting);
 
-  db.prepare('UPDATE characters SET proactive_streak = ? WHERE id = ?')
+  stmt('UPDATE characters SET proactive_streak = ? WHERE id = ?')
     .run(streak + 1, candidate.id);
 
-  // 如果需要配图，先生成图片再一起推送；否则直接推送
-  // 梦境动机同样走标准配图管线——现场生成全新配图，绝不复用睡中应答时用户已看过的图（防重复配图）
-  let imageUrls = null;
-  if (motive.imageGen) {
-    imageUrls = await generateImageForGreeting(candidate, greeting, motive.name, lastMsgId, rawId);
-  }
-
+  // **先发文本**（2026-10-02 结构性改造，与 1350 行那条链同一口径）：
+  //   文本立刻上屏，配图后台生成完再补挂。原来要 await 出图才广播 ⇒ ComfyUI 慢/关着时她的话一直不出现。
   broadcastProactiveMessage({
     character_id: candidate.id,
     display_name: candidate.display_name,
     avatar_path: candidate.avatar_path,
-
     content: greeting,
     segments,
     msg_ids: msgIds,
     msg_id: firstMsgId,
     raw_id: rawId,
-    images: imageUrls || [],
+    images: [],
     created_at: new Date().toISOString(),
   });
+
+  // 如果需要配图就生成（仍在 tick 内 await —— 紧随其后的亲密看板记账依赖"prompt 已写回 raw"这个锚点；
+  // 梦境动机同样走标准配图管线——现场生成全新配图，绝不复用睡中应答时用户已看过的图（防重复配图））
+  let imageUrls = null;
+  if (motive.imageGen) {
+    imageUrls = await generateImageForGreeting(candidate, greeting, motive.name, lastMsgId, rawId);
+  }
+
+  // 图后补：挂到已上屏的那条气泡（前端按 msg_id 找气泡；失败只 warn）
+  if (imageUrls?.length) {
+    try {
+      broadcast('proactive_message_update', { msg_id: firstMsgId, raw_id: rawId, images: imageUrls });
+    } catch (err) {
+      console.warn('⚡ 配图补挂广播失败（文字已上屏，不影响）:', err?.message || err);
+    }
+  }
+
+  // ── 亲密看板记账（task-42）──
+  // 这条链**完全绕开 chat.js**（writeProactiveMessage 直接落 raw），所以 chat.js 里那两处记账挂点
+  // 一个都不会跑到：强制高潮点下去立刻触发的这一轮，过去在看板上永远没有流水。
+  // 位置必须在 generateImageForGreeting 之后 —— 它才是把 prompt 写回 raw 的那一步，
+  // 而 recordFromConversationTail 是按「最后一条带 prompt 的 assistant raw」找锚点的。
+  // 失败只 warn：记账是旁路，不能影响主动消息本身。
+  try {
+    const rec = recordFromConversationTail({
+      characterId: candidate.id,
+      conversationId,
+      scene: 'chat',
+      partnerKind: 'user',
+      // 强制高潮轮：即使不在催眠中（task-42「随时都能触发」），也允许正文兜底记一笔
+      forceTextFallback: forcedClimax,
+    });
+    if (rec && rec.inserted > 0) console.log(`⚡ [intimate] proactive round recorded ${rec.inserted} act(s) for ${candidate.display_name}`);
+  } catch (err) {
+    console.warn('[intimate] proactive round record failed:', err.message);
+  }
+
+  // ⚠️ 这里原来还有一次 broadcastProactiveMessage（把文本+图一起推）——
+  // 2026-10-02「先发文本、图后补」改造后，文本已在 writeProactiveMessage 之后立刻推过、
+  // 图也在生成完后用 proactive_message_update 补挂，**这一处必须删掉**，否则前端会重复上屏一次。
 
   // 梦境系统：梦已正式分享（出口④）
   if (sharedDream?.id) {

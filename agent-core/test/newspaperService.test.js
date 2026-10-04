@@ -308,21 +308,31 @@ test('pickWorldLoot draws only from clothing and transform pools', () => {
   }
 });
 
-test('pickWorldLoot follows 50/50 clothing-transform split with 40% world_outfit inside clothing', () => {
+test('pickWorldLoot follows 40/60 clothing-transform split with 40% world_outfit inside clothing', () => {
   const N = 2000;
   const count = { outfit: 0, world_outfit: 0, transform: 0 };
-  for (let i = 0; i < N; i++) count[svc.pickWorldLoot(true).kind]++;
+  const formNames = new Set(svc.WORLD_TRANSFORM_FORMS.map(f => f.name));
+  for (let i = 0; i < N; i++) {
+    const loot = svc.pickWorldLoot(true);
+    count[loot.kind]++;
+    if (loot.kind === 'transform') {
+      // 变身日必须从预设形态池锁定一种，不再由 LLM 自由发挥
+      assert.ok(formNames.has(loot.name), `transform loot name must come from WORLD_TRANSFORM_FORMS, got ${loot.name}`);
+      assert.ok(loot.theme && loot.theme.includes(loot.name === '精灵耳' ? '精灵' : loot.name), 'theme must describe the locked form');
+      assert.equal(loot.key, 'transform');
+    }
+  }
   // 容差 ~±5pp（2000 次时单比例 6σ≈3.4pp，取整留裕量）
   const ratio = k => count[k] / N;
-  assert.ok(Math.abs(ratio('transform') - 0.5) < 0.05, `transform should be ~50%, got ${(ratio('transform') * 100).toFixed(1)}%`);
-  assert.ok(Math.abs(ratio('world_outfit') - 0.2) < 0.05, `world_outfit should be ~20% (50% × 40%), got ${(ratio('world_outfit') * 100).toFixed(1)}%`);
-  assert.ok(Math.abs(ratio('outfit') - 0.3) < 0.05, `fixed outfits should be ~30%, got ${(ratio('outfit') * 100).toFixed(1)}%`);
+  assert.ok(Math.abs(ratio('transform') - 0.4) < 0.05, `transform should be ~40%, got ${(ratio('transform') * 100).toFixed(1)}%`);
+  assert.ok(Math.abs(ratio('world_outfit') - 0.24) < 0.05, `world_outfit should be ~24% (60% × 40%), got ${(ratio('world_outfit') * 100).toFixed(1)}%`);
+  assert.ok(Math.abs(ratio('outfit') - 0.36) < 0.05, `fixed outfits should be ~36%, got ${(ratio('outfit') * 100).toFixed(1)}%`);
 
   // 无世界观：40% 分支回落固定款，world_outfit 恒为 0
   const noWorld = { outfit: 0, transform: 0 };
   for (let i = 0; i < N; i++) noWorld[svc.pickWorldLoot(false).kind]++;
-  assert.equal(noWorld.transform / N > 0.4 && noWorld.transform / N < 0.6, true);
-  assert.ok(noWorld.outfit / N > 0.4 && noWorld.outfit / N < 0.6, `without world setting outfit should be ~50%, got ${(noWorld.outfit / N * 100).toFixed(1)}%`);
+  assert.ok(noWorld.transform / N > 0.3 && noWorld.transform / N < 0.5, `without world setting transform should be ~40%, got ${(noWorld.transform / N * 100).toFixed(1)}%`);
+  assert.ok(noWorld.outfit / N > 0.5 && noWorld.outfit / N < 0.7, `without world setting outfit should be ~60%, got ${(noWorld.outfit / N * 100).toFixed(1)}%`);
 });
 
 test('buildFormatPrompt locks world_state to the drawn loot', () => {
@@ -342,6 +352,8 @@ test('setWorldStateDismissed toggles today paper world state on and off', () => 
   db.prepare('DELETE FROM town_newspapers').run();
   db.prepare(`INSERT INTO characters (name, display_name, base_prompt) VALUES ('groupLead', '群主小姐', 'x')`).run();
   const leadId = db.prepare(`SELECT id FROM characters WHERE name = 'groupLead'`).get().id;
+  db.prepare(`INSERT INTO group_chats (name) VALUES ('日报开关测试群')`).run();
+  const groupId = db.prepare(`SELECT id FROM group_chats WHERE name = '日报开关测试群'`).get().id;
   db.prepare(`
     INSERT INTO town_newspapers (publish_date, name, edition, items_json, character_id, character_event_json, world_state_json, world_dismissed, moment_done, complaint_after)
     VALUES (?, '邻舍日报', 1, '[]', ?, ?, ?, 0, 0, NULL)
@@ -353,18 +365,19 @@ test('setWorldStateDismissed toggles today paper world state on and off', () => 
 
   // 主角不在群里 → 整块不注入（2026-09-29 起的口径：群成员聊"特稿里陌生人的事"只会出戏）
   assert.equal(
-    svc.getGroupNewspaperBlockFor({ members: [] }), '',
+    svc.takeGroupNewspaperBlockFor({ id: groupId, members: [] }), '',
     'group without the featured character must get no newspaper block at all',
   );
   // 主角在群里 → 注入，含世界状态段与特稿新闻
-  const withLead = svc.getGroupNewspaperBlockFor({ members: [{ id: leadId, display_name: '群主小姐' }] });
+  const group = { id: groupId, members: [{ id: leadId, display_name: '群主小姐' }] };
+  const withLead = svc.takeGroupNewspaperBlockFor(group);
   assert.ok(withLead.includes('今日状态'), 'group block must carry the world state before dismissal');
   assert.ok(withLead.includes('今日新闻'), 'group block must carry the featured news');
   assert.ok(withLead.includes('群主小姐'), 'featured member must be named in the group block');
 
   assert.equal(svc.setWorldStateDismissed(true), true);
   assert.equal(svc.getWorldStateBlock(), '', 'dismissed world state must not inject into chat anymore');
-  const groupBlock = svc.getGroupNewspaperBlockFor({ members: [{ id: leadId, display_name: '群主小姐' }] });
+  const groupBlock = svc.takeGroupNewspaperBlockFor(group);
   assert.ok(!groupBlock.includes('今日状态'), 'dismissed world state must not inject into group chats');
   assert.ok(groupBlock.includes('今日新闻'), 'featured news stays in the group block after dismissal');
   const row = db.prepare('SELECT world_dismissed FROM town_newspapers WHERE publish_date = ?').get(getLocalDateKey());
@@ -377,7 +390,68 @@ test('setWorldStateDismissed toggles today paper world state on and off', () => 
   assert.equal(svc.setWorldStateDismissed(false), true);
 
   db.prepare('DELETE FROM town_newspapers').run();
+  db.prepare(`DELETE FROM group_chats WHERE id = ?`).run(groupId);
   db.prepare(`DELETE FROM characters WHERE name = 'groupLead'`).run();
+});
+
+test('group newspaper block stops after GROUP_INJECT_ROUNDS rounds for the same paper', () => {
+  const db = getDb();
+  db.prepare('DELETE FROM town_newspapers').run();
+  db.prepare(`INSERT INTO characters (name, display_name, base_prompt) VALUES ('capLead', '限额小姐', 'x')`).run();
+  db.prepare(`INSERT INTO characters (name, display_name, base_prompt) VALUES ('capBystander', '路人先生', 'x')`).run();
+  const leadId = db.prepare(`SELECT id FROM characters WHERE name = 'capLead'`).get().id;
+  const bystanderId = db.prepare(`SELECT id FROM characters WHERE name = 'capBystander'`).get().id;
+  db.prepare(`INSERT INTO group_chats (name) VALUES ('限额测试群')`).run();
+  const groupId = db.prepare(`SELECT id FROM group_chats WHERE name = '限额测试群'`).get().id;
+
+  const insertPaper = db.prepare(`
+    INSERT INTO town_newspapers (publish_date, name, edition, items_json, character_id, character_event_json, world_state_json, world_dismissed, moment_done, complaint_after)
+    VALUES (?, '邻舍日报', ?, '[]', ?, ?, NULL, 0, 0, NULL)
+  `);
+  insertPaper.run(getLocalDateKey(), 1, leadId,
+    JSON.stringify({ title: '限额小姐的大事件', content: '特稿正文', note: 'n' }));
+  const paperId = db.prepare(`SELECT id FROM town_newspapers WHERE publish_date = ?`).get(getLocalDateKey()).id;
+
+  const group = { id: groupId, members: [{ id: leadId, display_name: '限额小姐' }] };
+  // 主角不在群：不发块、也不消耗轮数（之后主角入群仍能拿到完整的 4 轮）
+  assert.equal(svc.takeGroupNewspaperBlockFor({ id: groupId, members: [{ id: bystanderId, display_name: '路人先生' }] }), '');
+  assert.equal(
+    db.prepare('SELECT newspaper_rounds_used FROM group_chats WHERE id = ?').get(groupId).newspaper_rounds_used, 0,
+    'a group without the featured member must not burn rounds',
+  );
+
+  for (let round = 1; round <= svc.GROUP_INJECT_ROUNDS; round++) {
+    assert.ok(
+      svc.takeGroupNewspaperBlockFor(group).includes('<newspaper_today>'),
+      `round ${round} must still carry the newspaper block`,
+    );
+  }
+  // 第 5 轮起当天不再注入（用户反馈：主角在群里被反复提起）
+  assert.equal(svc.takeGroupNewspaperBlockFor(group), '', 'after the limit the block must be gone for the day');
+  const usage = db.prepare('SELECT newspaper_paper_id, newspaper_rounds_used FROM group_chats WHERE id = ?').get(groupId);
+  assert.equal(usage.newspaper_paper_id, paperId, 'usage is recorded against the current paper');
+  assert.equal(usage.newspaper_rounds_used, svc.GROUP_INJECT_ROUNDS, 'used rounds stop at the limit');
+  // 记账落库：重启/换进程也不会把同一期报纸重新发放一遍
+  assert.equal(db.prepare('SELECT newspaper_rounds_used FROM group_chats WHERE id = ?').get(groupId).newspaper_rounds_used, svc.GROUP_INJECT_ROUNDS);
+
+  // 次日新一期（同一天同一行被换掉 → 新 paper_id）：计数自动归零，重新发放
+  db.prepare('DELETE FROM town_newspapers').run();
+  insertPaper.run(getLocalDateKey(), 2, leadId,
+    JSON.stringify({ title: '限额小姐的明日事件', content: '特稿正文', note: 'n' }));
+  const nextPaperId = db.prepare(`SELECT id FROM town_newspapers WHERE publish_date = ?`).get(getLocalDateKey()).id;
+  assert.notEqual(nextPaperId, paperId, 'a fresh edition must have its own paper id');
+  assert.ok(
+    svc.takeGroupNewspaperBlockFor(group).includes('<newspaper_today>'),
+    'a new paper re-arms the block',
+  );
+  assert.equal(
+    db.prepare('SELECT newspaper_rounds_used FROM group_chats WHERE id = ?').get(groupId).newspaper_rounds_used, 1,
+    'rounds restart from zero for the new paper',
+  );
+
+  db.prepare('DELETE FROM town_newspapers').run();
+  db.prepare(`DELETE FROM group_chats WHERE id = ?`).run(groupId);
+  db.prepare(`DELETE FROM characters WHERE name IN ('capLead', 'capBystander')`).run();
 });
 
 test('listNewspaperEditions and getNewspaperByDate support past edition browsing', () => {

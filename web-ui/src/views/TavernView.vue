@@ -176,7 +176,32 @@
           <span>表情包管理</span>
         </div>
 
+        <!-- 一键后台生成全部角色资产（2026-10-01 用户：「弄个按钮一键后台生成得了」）：
+             与表情包管理同款卡片、同一区域，点开是后台串行任务（关窗继续跑）。 -->
+        <div key="asset-gen" class="char-card emoji-manage-card" @click="showAssetGen = true">
+          <div class="emoji-manage-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" />
+              <circle cx="12" cy="12" r="3.2" />
+            </svg>
+          </div>
+          <span>一键生成素材</span>
+        </div>
+
       <!-- 招募卡片：永远在第一格 -->
+      <div key="standing-manage" class="char-card emoji-manage-card standing-manage-card" role="button" tabindex="0" @click="showStandingManager = true" @keydown.enter.prevent="showStandingManager = true" @keydown.space.prevent="showStandingManager = true">
+        <div class="emoji-manage-icon">
+          <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="10" r="6" />
+            <circle cx="10" cy="9" r=".9" fill="currentColor" stroke="none" />
+            <path d="m14 8.5 1.5 1M10 12.5q2 2 4 0" stroke-width="1.7" />
+            <path d="M4 25v-2a7 7 0 0 1 7-7h2c4 0 5 4 8 4s5-3 5-6M8 24v4h10v-5M24 5h6M27 2v6" />
+          </svg>
+        </div>
+        <span>立绘管理</span>
+      </div>
+
+      <!-- 招募卡片：管理入口之后 -->
       <div key="recruit" class="char-card recruit-card" @click="openRecruit">
         <div class="recruit-plus">+</div>
         <span>招募</span>
@@ -625,6 +650,8 @@
     <NewspaperModal v-model="showNewspaper" @read="onNewspaperRead" />
 
       <EmojiManagerModal v-if="showEmojiManager" :characters="sortedCharacters" @close="showEmojiManager = false" />
+      <AssetGenerationModal v-if="showAssetGen" :characters="sortedCharacters" @close="showAssetGen = false" />
+      <StandingManagerModal :open="showStandingManager" :characters="sortedCharacters" @close="showStandingManager = false" />
   </div>
 </template>
 
@@ -643,35 +670,35 @@ import MailboxModal from '../components/MailboxModal.vue'
 import BackpackModal from '../components/BackpackModal.vue'
 import NewspaperModal from '../components/NewspaperModal.vue'
 import EmojiManagerModal from '../components/EmojiManagerModal.vue'
+import AssetGenerationModal from '../components/AssetGenerationModal.vue'
+import StandingManagerModal from '../components/StandingManagerModal.vue'
 import AppearanceRefineModal from '../components/AppearanceRefineModal.vue'
 import LinsheButton from '../components/ui/LinsheButton.vue'
 import LinsheInput from '../components/ui/LinsheInput.vue'
 import { useBurst } from '../composables/useBurst.js'
 import { useMailboxStore } from '../stores/mailbox.js'
 import { useBackpackStore } from '../stores/backpack.js'
+import { useNewspaperStore } from '../stores/newspaper.js'
 
 const router = useRouter()
 const chat = useChatStore()
 const mailboxStore = useMailboxStore()
 const backpackStore = useBackpackStore()
+const newspaperStore = useNewspaperStore()
 
 const showMailbox = ref(false)
 const showBackpack = ref(false)
 const showEmojiManager = ref(false)
+/** 一键后台生成全部角色资产（立绘/表情包/表情立绘） */
+const showAssetGen = ref(false)
+const showStandingManager = ref(false)
 const mailboxUnread = computed(() => mailboxStore.unreadCount)
 const backpackChestReady = computed(() => backpackStore.chestReady)
 
-// 《邻舍日报》：今天的报纸是否存在 + 是否已读（红点）
+// 《邻舍日报》：未读状态由 newspaper store 统一持有（NavBar 酒馆项红点同源）
 const showNewspaper = ref(false)
-const todayPaper = ref(null)
-const newspaperUnread = computed(() => {
-  if (!todayPaper.value) return false
-  try {
-    return localStorage.getItem('linshe.newspaper.last_read') !== todayPaper.value.publish_date
-  } catch {
-    return false
-  }
-})
+const todayPaper = computed(() => newspaperStore.todayPaper)
+const newspaperUnread = computed(() => newspaperStore.unread)
 const newspaperHint = computed(() => todayPaper.value
   ? `第${todayPaper.value.edition}期已印好 · 今日事，早知道`
   : '清晨 5 点后印出 · 今日事，早知道')
@@ -682,17 +709,11 @@ function openNewspaper() {
 
 // 打开看过即消红点（今天之内不再提醒）
 function onNewspaperRead(paper) {
-  todayPaper.value = paper
-  try {
-    localStorage.setItem('linshe.newspaper.last_read', paper.publish_date)
-  } catch { /* 隐私模式下静默 */ }
+  newspaperStore.markRead(paper)
 }
 
-async function loadTodayPaper() {
-  try {
-    const data = await api.getTodayNewspaper()
-    todayPaper.value = data?.newspaper || null
-  } catch { /* 拉不到就只隐藏红点 */ }
+function loadTodayPaper() {
+  newspaperStore.fetchToday()
 }
 
 // 置顶优先，组内按 display_name 首字母排序（中文按拼音）
@@ -2317,6 +2338,7 @@ onMounted(async () => {
   border-color: var(--accent);
   background: rgba(var(--accent-rgb), 0.06);
 }
+.standing-manage-card { border-color: var(--border-strong); text-align: center; cursor: pointer; }
 .emoji-manage-icon {
   width: 34px; height: 34px;
   color: var(--accent);

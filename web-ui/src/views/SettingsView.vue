@@ -77,8 +77,36 @@
             <div class="hiresfix-copy">
               <div class="hiresfix-desc">图片进一步高清细化设置</div>
             </div>
-            <span class="hiresfix-summary">{{ hiresWorkflowMode === 'advanced' ? '进阶版' : '基础版' }} · 最长边 {{ hiresMaxSize }} · {{ hiresWorkflowMode === 'advanced' && hiresSamplingMode === 'source' ? '采样跟随原图' : `${hiresSteps} 步 · CFG ${hiresCfg}` }} · 重绘 {{ hiresDenoise }}{{ hiresLoraCount > 0 ? ` · LoRA ${hiresLoraCount}` : '' }}</span>
+            <span class="hiresfix-summary">{{ hiresSummary }}</span>
             <linshe-button class="hiresfix-link" variant="link" @click="openHiresFixSettings">设置 →</linshe-button>
+          </div>
+          <div class="hiresfix-row hiresfix-turbo-row">
+            <div class="hiresfix-copy">
+              <div class="hiresfix-turbo-title">细化用 turbo 参数（更快）</div>
+              <div class="hiresfix-desc">打开：CFG {{ HIRES_TURBO_CFG.toFixed(1) }} / {{ HIRES_TURBO_STEPS }} 步，速度约快一倍、更贴合 turbo 模型；关闭：沿用「设置 →」里的步数与 CFG</div>
+              <div class="hiresfix-desc">{{ hiresTurbo ? '当前「设置 →」里的步数与 CFG 不生效（仍可照常修改，关掉本开关后即按它们细化）' : '当前按「设置 →」里的步数与 CFG 细化' }}</div>
+            </div>
+            <linshe-switch
+              v-model="hiresTurbo"
+              on-text="已启用"
+              off-text="已关闭"
+              aria-label="细化用 turbo 参数"
+              title="细化用 turbo 参数（CFG 1.0 / 12 步）"
+              @change="onHiresTurboToggle"
+            />
+          </div>
+          <div class="hiresfix-row">
+            <div class="hiresfix-copy">
+              <div class="hiresfix-turbo-title">细化精度</div>
+              <div class="hiresfix-desc">她出图后那道细化重绘的步数。越低越快、细节略软；越高越保真、更慢。（高 12 步 / 中 10 步 / 低 8 步，默认低）</div>
+            </div>
+            <linshe-tabs
+              :model-value="normalizeHiresQuality(features.hiresQuality)"
+              :options="HIRES_QUALITY_MODES"
+              size="sm"
+              class="hiresfix-quality-tabs"
+              @update:model-value="saveHiresQuality"
+            />
           </div>
         </div>
         <div class="quality-section">
@@ -113,7 +141,7 @@
       </div>
 
       <GlobalLoraModal v-model="globalLoraModalVisible" :initial-loras="globalLoras" @saved="onGlobalLoraSaved" />
-      <HiresFixModal v-if="imageProvider !== 'novelai'" v-model="hiresFixModalVisible" :initial-sampling-mode="hiresSamplingMode" :initial-global-lora-scale="hiresGlobalLoraScale" :initial-source-blend="hiresSourceBlend" :initial-upscale-model="hiresUpscaleModel" :initial-workflow-mode="hiresWorkflowMode" :initial-loras="hiresLoras" :initial-steps="hiresSteps" :initial-cfg="hiresCfg" :initial-denoise="hiresDenoise" :initial-max-size="hiresMaxSize" :initial-artist-mode="hiresArtistMode" :initial-artist="hiresArtist" @saved="onHiresFixSaved" />
+      <HiresFixModal v-if="imageProvider !== 'novelai'" v-model="hiresFixModalVisible" :initial-sampling-mode="hiresSamplingMode" :initial-global-lora-scale="hiresGlobalLoraScale" :initial-source-blend="hiresSourceBlend" :initial-upscale-model="hiresUpscaleModel" :initial-workflow-mode="hiresWorkflowMode" :initial-loras="hiresLoras" :initial-steps="hiresSteps" :initial-cfg="hiresCfg" :initial-denoise="hiresDenoise" :initial-max-size="hiresMaxSize" :initial-artist-mode="hiresArtistMode" :initial-artist="hiresArtist" :initial-turbo="hiresTurbo" @saved="onHiresFixSaved" />
 
 
       <!-- 测试画风：自由画面描述（LLM 完善提示词）或固定提示词测试 -->
@@ -280,7 +308,7 @@
             tabindex="0"
             :class="['free-egg-btn', { active: freeEgg, 'is-disabled': freeEggBusy }]"
             :aria-disabled="freeEggBusy"
-            :title="freeEgg ? '点击关闭，恢复自有 LLM 配置' : '点击开启：免 Key 使用 opencode 免费模型，每5小时每IP限200次'"
+            :title="freeEgg ? '点击关闭，恢复自有 LLM 配置' : '点击开启：免 Key 使用 opencode 免费模型（按 IP 限流，上游限速会调整）'"
             @click="onFreeEggClick"
             @keydown.enter.prevent="onFreeEggClick"
             @keydown.space.prevent="onFreeEggClick"
@@ -397,10 +425,25 @@
         </div>
         <p v-if="llmModelsError" class="model-fetch-error" role="alert">{{ llmModelsError }}</p>
 
+        <!-- 上下文窗口（token）：留空则由服务端从上游探测 / 用默认值 -->
+        <label class="fl llm-label" for="llm-context-window">上下文窗口</label>
+        <linshe-input
+          id="llm-context-window"
+          v-model.trim="llmContextWindowText"
+          class="fi"
+          inputmode="numeric"
+          :invalid="!llmContextWindowValid"
+          placeholder="1000000"
+          aria-label="上下文窗口（token）"
+          @input="markLlmDirty"
+        />
+        <p v-if="!llmContextWindowValid" class="gen-error" role="alert">请填写大于 0 的整数 token 数，或留空自动探测</p>
+        <p v-else class="fd llm-context-window-hint">留空则自动从服务端模型列表探测</p>
+
         <div v-if="isCustomBaseURL" class="toggle-row thinking-setting">
           <div>
             <div class="tl llm-label">思考模式</div>
-            <div class="td">“关”默认禁用思考；“不传”会从请求体中省略 thinking 参数</div>
+            <div class="td">默认「关」：请求里明确禁用思考，回复更快也更省 token；选「开」则允许模型先思考再回答</div>
           </div>
           <div :class="['thinking-options', `is-${llmThinkingMode}`]" role="radiogroup" aria-label="思考模式">
             <label v-for="option in thinkingModeOptions" :key="option.value" class="thinking-option">
@@ -503,7 +546,7 @@ type="range" min="1" max="10" step="1"
         </template>
 
         <div class="sa" style="margin-top:12px">
-          <linshe-button variant="primary" :disabled="!llmDirty || !llmHeadersValid || !llmExtraBodyValid" @click="saveLlmConfig">保存</linshe-button>
+          <linshe-button variant="primary" :disabled="!llmDirty || !llmHeadersValid || !llmExtraBodyValid || !llmContextWindowValid" @click="saveLlmConfig">保存</linshe-button>
           <span v-if="llmSaved" class="smsg">已保存</span>
           <linshe-button class="llm-test-btn" variant="secondary" :disabled="llmTesting || !llmHeadersValid || !llmExtraBodyValid" @click="runLlmConnectionTest">
             {{ llmTesting ? '测试中…' : '测试连接' }}
@@ -682,6 +725,215 @@ type="range" min="0" max="1" step="0.1"
 <gear-icon :size="17" />
 </div>
           <linshe-switch v-model="features.weather" @change="saveFeature('weather', features.weather)" />
+        </div>
+
+        <!-- 亲密度看板（总开关：关闭后不再自动记账，看板写入与回填接口返回 409） -->
+        <div class="toggle-row">
+          <div>
+            <div class="tl">亲密度看板</div>
+            <div class="td">记录角色的身体档案与相处统计，并允许角色在对话中知晓；关闭后停止自动记账与历史回填</div>
+          </div>
+          <linshe-switch v-model="features.intimate" aria-label="亲密度看板" title="亲密度看板" @change="saveIntimateFeature('intimate', features.intimate)" />
+        </div>
+
+        <!-- 历史对话回填（默认开：把以往会话中能识别的记录补进看板流水） -->
+        <div class="toggle-row">
+          <div>
+            <div class="tl">历史对话回填</div>
+            <div class="td">把以往的对话记录补进看板流水，仅在亲密度看板开启时生效</div>
+          </div>
+          <linshe-switch v-model="features.intimateBackfill" aria-label="历史对话回填" title="历史对话回填" @change="saveIntimateFeature('intimateBackfill', features.intimateBackfill)" />
+        </div>
+      </div>
+
+      <!-- 反重复 / 反钻牛角尖（专题·车轱辘话与钻牛角尖 · 阶段一）
+           顶上三个开关是纯 prompt 增强（零额外 LLM 调用），默认开；关闭后与加功能前逐字节一致。
+           「重写兜底」antiRepetitionReroll（专题 L4 / D2）**已接线**：默认关，打开后每触发一次会**多消耗一次模型调用**，
+           故说明里写明代价；替换语义见 stores/chat.js 与 docs/anti-repetition.md。 -->
+      <div class="card anti-rep-card">
+        <h3>反重复与话题推进</h3>
+        <p class="fd">角色连续几轮围绕同一话题打转时，动态提示她换角度、引入新信息或推进事件；同一情绪持续多轮时提示她像真人一样打断自己。全部是提示词层的增强，不额外调用模型。</p>
+
+        <div class="toggle-row">
+          <div>
+            <div class="tl">反车轱辘话</div>
+            <div class="td">最近几轮话题重叠超过阈值时，提示她换一种说法或推进话题（另附一条近端自身输出标注）</div>
+          </div>
+          <linshe-switch
+            v-model="features.antiRepetition"
+            aria-label="反车轱辘话"
+            title="反车轱辘话"
+            @change="saveAntiRepFeature('antiRepetition', features.antiRepetition)"
+          />
+        </div>
+
+        <div class="toggle-row">
+          <div>
+            <div class="tl">反钻牛角尖</div>
+            <div class="td">同一情绪极值连续多轮且话题没换时，提示她自我打断、分心或做个小决定，让对话往前走</div>
+          </div>
+          <linshe-switch
+            v-model="features.antiRepetitionLock"
+            aria-label="反钻牛角尖"
+            title="反钻牛角尖"
+            @change="saveAntiRepFeature('antiRepetitionLock', features.antiRepetitionLock)"
+          />
+        </div>
+
+        <!-- B1 阶段二：升级档（默认开）。关掉只留温和提示；重写兜底 antiRepetitionReroll 本轮不接线，故无入口。 -->
+        <div class="toggle-row">
+          <div>
+            <div class="tl">重复时自动加强约束</div>
+            <div class="td">她连续 3 轮在复述同一件事时，把约束从温和升到更强；一旦不再重复立刻回落。关掉则只保留温和提示</div>
+          </div>
+          <linshe-switch
+            v-model="features.antiRepetitionEscalation"
+            aria-label="重复时自动加强约束"
+            title="重复时自动加强约束"
+            @change="saveAntiRepFeature('antiRepetitionEscalation', features.antiRepetitionEscalation)"
+          />
+        </div>
+
+        <!-- D2 重写兜底（默认关）：用户点名「做个开关放到设置里说明」，说明里必须写清代价 -->
+        <div class="toggle-row">
+          <div>
+            <div class="tl">重写这一轮</div>
+            <div class="td">她还在复读时，把这一轮的话重写一次（会多消耗一次模型调用，默认关闭）—— 重写后原先那段会被整段换掉，不会重复出现</div>
+          </div>
+          <linshe-switch
+            v-model="features.antiRepetitionReroll"
+            aria-label="重写这一轮"
+            title="重写这一轮"
+            @change="saveAntiRepFeature('antiRepetitionReroll', features.antiRepetitionReroll)"
+          />
+        </div>
+
+        <!-- 玩具系统总开关（用户拍板：一次性解锁，同 touchGroupAdult 先例；默认关） -->
+        <div class="toggle-row">
+          <div>
+            <div class="tl">解锁成人玩具</div>
+            <div class="td">打开后，触摸面板里多一块「玩具控制」：可以给她戴上跳蛋 / 振动棒 / 肛塞 / 乳夹 / 项圈，调强度、随时摘下，她会当场有反应（默认关）</div>
+          </div>
+          <linshe-switch
+            v-model="features.toys"
+            aria-label="解锁成人玩具"
+            title="解锁成人玩具"
+            @change="saveFeatureWithToast('toys', features.toys, '成人玩具')"
+          />
+        </div>
+
+        <!-- 采样层（专题 L3）：默认留空 = 请求体里完全不发送这两个字段，行为与历史完全一致。
+             规划 C5 要求先拿真网关探针确认参数被接受再上 UI；未探明前请保持留空。 -->
+        <div class="anti-rep-penalty">
+          <div class="anti-rep-penalty-copy">
+            <div class="tl">重复惩罚参数（高级）</div>
+            <div class="td">透传 presence_penalty / frequency_penalty 给模型接口，范围 -2 ~ 2。留空表示不发送；部分第三方中转站不接受该参数，若保存后回复出错请清空重试。</div>
+          </div>
+          <div class="anti-rep-penalty-inputs">
+            <label class="anti-rep-field">
+              <span class="anti-rep-field-label">presence</span>
+              <linshe-input v-model="antiRepPenaltyPresence" class="fi anti-rep-input" placeholder="留空" :invalid="!antiRepPenaltyPresenceValid" @keyup.enter="onAntiRepPenaltySave" />
+            </label>
+            <label class="anti-rep-field">
+              <span class="anti-rep-field-label">frequency</span>
+              <linshe-input v-model="antiRepPenaltyFrequency" class="fi anti-rep-input" placeholder="留空" :invalid="!antiRepPenaltyFrequencyValid" @keyup.enter="onAntiRepPenaltySave" />
+            </label>
+            <linshe-button variant="secondary" size="sm" :loading="antiRepPenaltySaving" :disabled="!antiRepPenaltyValid" @click="onAntiRepPenaltySave">保存</linshe-button>
+            <span v-if="antiRepPenaltySaved" class="smsg">已保存</span>
+          </div>
+        </div>
+        <p v-if="antiRepPenaltyError" class="gen-error" role="alert">{{ antiRepPenaltyError }}</p>
+      </div>
+
+      <!-- SLG 动作系统（触摸互动 · 专题-SLG动作系统）
+           前两个开关默认开：总开关控制聊天页动作条与 POST /touch；即时反应关掉后走"隐式注入"，
+           她的反应并进下一轮回复，不额外调用模型（配额清零只影响即时那条路）。
+           第三个（群聊敏感动作）**默认关**：关着时群里点 Lv3 一律被拦，行为与加开关前一致。 -->
+      <div class="card touch-action-card">
+        <h3>动作系统（触摸互动）</h3>
+        <p class="fd">聊天页输入框上方会出现一条动作胶囊条（摸头 / 抱抱 / 亲脸颊…）。点下去她会当场有反应，连续点同一个动作会逐渐不耐烦。即时反应是"立刻单独回一条"，关掉后改成并进下一轮回复。</p>
+
+        <div class="toggle-row">
+          <div>
+            <div class="tl">动作系统</div>
+            <div class="td">关闭后聊天页不再显示动作条，后端也会拒绝动作请求（已记录的动作反应不受影响）</div>
+          </div>
+          <linshe-switch
+            v-model="features.touch"
+            aria-label="动作系统"
+            title="动作系统"
+            @change="saveTouchFeature('touch', features.touch)"
+          />
+        </div>
+
+        <div class="toggle-row">
+          <div>
+            <div class="tl">即时反应</div>
+            <div class="td">点动作后立刻单独发一条反应（含表情与心情变化）；每日 100 次，额度用完自动并回下一轮</div>
+          </div>
+          <linshe-switch
+            v-model="features.touchInstant"
+            aria-label="即时反应"
+            title="即时反应"
+            @change="saveTouchFeature('touchInstant', features.touchInstant)"
+          />
+        </div>
+
+        <div class="toggle-row">
+          <div>
+            <div class="tl">群聊里的敏感动作</div>
+            <div class="td">允许在群聊里对角色做 Lv3 敏感动作（摸胸 / 摸臀等）。默认关闭：这种事留到只有你们俩的时候；打开后群成员可能围观</div>
+          </div>
+          <linshe-switch
+            v-model="features.touchGroupAdult"
+            aria-label="群聊里的敏感动作"
+            title="群聊里的敏感动作"
+            @change="saveTouchFeature('touchGroupAdult', features.touchGroupAdult)"
+          />
+        </div>
+
+        <!-- 动作出图档位（阶段三）：三档用 LinsheTabs，键与后端 features.touchImageMode 同口径 -->
+        <div class="toggle-row touch-image-mode-row">
+          <div>
+            <div class="tl">动作出图</div>
+            <div class="td">她做完动作后要不要顺手配一张图。「智能」只在合适的时候配（默认）；「总是」每次都配；「从不」只要文字。</div>
+          </div>
+          <linshe-tabs
+            :model-value="normalizeTouchImageMode(features.touchImageMode)"
+            :options="TOUCH_IMAGE_MODES"
+            size="sm"
+            class="touch-image-mode-tabs"
+            @update:model-value="saveTouchImageMode"
+          />
+        </div>
+
+        <!-- 群聊围观插话概率（task-22）：开关 + 概率滑块；关掉＝这轮其他成员都不发言 -->
+        <div class="toggle-row">
+          <div>
+            <div class="tl">群聊里的围观插话</div>
+            <div class="td">在群里对某人做动作时，其他成员凑过来插一句的概率。关掉＝这一轮谁都不插话（与加功能前完全一致）</div>
+          </div>
+          <linshe-switch
+            v-model="bystanderEnabled"
+            aria-label="群聊里的围观插话"
+            title="群聊里的围观插话"
+            @change="saveBystanderEnabled"
+          />
+        </div>
+
+        <div v-if="bystanderEnabled" class="bystander-row">
+          <div class="bystander-slider">
+            <linshe-slider
+              id="touch-bystander-chance"
+              v-model="bystanderPercent"
+              :min="0"
+              :max="100"
+              :step="5"
+              aria-label="围观插话概率"
+              @change="saveBystanderChance"
+            />
+          </div>
+          <span class="bystander-value">{{ bystanderPercent }}%</span>
         </div>
       </div>
 
@@ -960,7 +1212,102 @@ type="range" min="0" max="1" step="0.1"
           </span>
         </div>
       </div>
+
+      <!-- 程序时间：白天/黑夜、第几天、快进 N 天、设定具体日期时间（现实模拟时钟） -->
+      <div class="card card-full memory-settings-card time-control-card">
+        <div class="memory-settings-header">
+          <div>
+            <h3>程序时间</h3>
+            <p>游戏里的"现在几点"。快进一天或直接跳到某个日期，所有角色的日程与睡眠会跟着重算；聊天记录的时间戳仍按真实时间走</p>
+          </div>
+        </div>
+        <TimeControlPanel />
+      </div>
+
+      <!-- 数据备份：一键导出全部数据 / 一键导入（导入是覆盖式操作，导入前自动备份） -->
+      <div class="card card-full memory-settings-card data-backup-card">
+        <div class="memory-settings-header">
+          <div>
+            <h3>数据备份</h3>
+            <p>把角色、聊天记录、群聊、记忆与图片打包成一个 .tar.gz；换电脑或重装后用同一个归档一键恢复</p>
+          </div>
+        </div>
+
+        <div class="data-backup-info" role="status" aria-live="polite">
+          <span class="data-backup-info-label">当前数据</span>
+          <span class="data-backup-info-text">{{ exportInfoLoading ? '读取中…' : exportInfoText }}</span>
+        </div>
+
+        <div class="toggle-row">
+          <div>
+            <div class="tl">包含模型配置（含 API Key）</div>
+            <div class="td">归档里会带上 config\.env；里面有你的密钥，这份备份不要发给别人</div>
+          </div>
+          <linshe-switch
+            v-model="exportIncludeConfig"
+            aria-label="导出时包含模型配置（含 API Key）"
+          />
+        </div>
+
+        <div class="data-backup-actions">
+          <linshe-button
+            variant="secondary"
+            size="sm"
+            :loading="exportBusy"
+            :disabled="exportBusy || importBusy"
+            @click="onExportData"
+          >
+            {{ exportBusy ? '导出中…' : '一键导出全部数据' }}
+          </linshe-button>
+          <linshe-button
+            variant="secondary"
+            size="sm"
+            :disabled="exportBusy || importBusy"
+            @click="pickImportFile"
+          >
+            一键导入
+          </linshe-button>
+          <span class="data-backup-tip">导入会覆盖当前数据库与资产文件；导入前会自动备份到 data\backups\</span>
+        </div>
+
+        <Transition name="backup-notice-fade">
+          <p v-if="importNotice" class="data-backup-notice" :class="`is-${importNotice.type}`" role="status">
+            {{ importNotice.text }}
+          </p>
+        </Transition>
+
+        <!-- 唯一允许的裸 input：隐藏的文件选择器（AGENTS.md 特殊交互元素白名单），
+             真正可点的控件是上面的 LinsheButton，因此这里不进 tab 序列也不读给读屏 -->
+        <input
+          ref="importFileEl"
+          class="data-backup-file"
+          type="file"
+          accept=".gz,.tar.gz,application/gzip"
+          tabindex="-1"
+          aria-hidden="true"
+          @change="onImportFilePicked"
+        />
+      </div>
 </div>
+
+    <!-- 导入二次确认：覆盖式破坏操作，必须让用户看清后果再上传 -->
+    <linshe-modal v-model="importDialog.show" title="确认导入备份？" panel-class="data-backup-modal">
+      <p class="data-backup-modal-line">
+        导入会<strong>覆盖当前数据库与资产文件</strong>；导入前会自动备份到
+        <code>data\backups\</code>，万一不满意可以用那份备份回滚。
+      </p>
+      <p class="data-backup-modal-line">
+        选中的文件：<strong>{{ importDialog.fileName }}</strong>
+        <span v-if="importDialog.fileSize" class="data-backup-modal-size">（{{ importDialog.fileSize }}）</span>
+      </p>
+      <p class="data-backup-modal-line">确认后开始上传，中途请不要关闭页面或退出程序。</p>
+      <template #footer>
+        <linshe-button variant="secondary" :disabled="importBusy" @click="importDialog.show = false">取消</linshe-button>
+        <linshe-button variant="danger" :loading="importBusy" :disabled="importBusy" @click="confirmImport">
+          {{ importBusy ? '导入中…' : '确认导入' }}
+        </linshe-button>
+      </template>
+    </linshe-modal>
 
     <!-- 收藏画师串弹窗 -->
     <linshe-modal v-model="favDialog.show" title="收藏画师串">
@@ -1135,13 +1482,14 @@ base
 <script setup>
 import { ref, reactive, computed, onMounted, inject, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
-import { getConfig, updateComfyConfig, updateLlmConfig, testLlmConnection, setLlmFreeEgg, fetchLlmModels, fetchLlmApiKey, updateFeatureFlag, imageProviderHealth, testStyle, testHires, updateProactiveFreq, updateEventFreq, updateBackgroundConcurrency, updateDisturbMode, updateDisturbSettings, updateWeatherCity, getArtistFavorites, addArtistFavorite, deleteArtistFavorite, listCharacters, restoreWorkflow, updateWorkflowMode, updateWorkflowScene, getLlmProfiles, addLlmProfile, deleteLlmProfile, activateLlmProfile, syncActiveLlmProfile } from '../api/index.js'
+import { getConfig, updateComfyConfig, updateLlmConfig, testLlmConnection, setLlmFreeEgg, fetchLlmModels, fetchLlmApiKey, updateFeatureFlag, updateAntiRepetitionPenalty, imageProviderHealth, testStyle, testHires, updateHiresSettings, updateProactiveFreq, updateEventFreq, updateBackgroundConcurrency, updateDisturbMode, updateDisturbSettings, updateWeatherCity, getArtistFavorites, addArtistFavorite, deleteArtistFavorite, listCharacters, restoreWorkflow, updateWorkflowMode, updateWorkflowScene, getLlmProfiles, addLlmProfile, deleteLlmProfile, activateLlmProfile, syncActiveLlmProfile, downloadDataArchive, getDataExportInfo, importDataArchive } from '../api/index.js'
 import { useSettingsStore } from '../stores/settings.js'
 import ImageLightbox from '../components/ImageLightbox.vue'
 import LinsheModal from '../components/ui/LinsheModal.vue'
 import BeforeAfterSlider from '../components/BeforeAfterSlider.vue'
 import LinsheSelect from '../components/ui/LinsheSelect.vue'
 import LinsheTabs from '../components/ui/LinsheTabs.vue'
+import { TOUCH_IMAGE_MODES, TOUCH_IMAGE_MODE_KEY, DEFAULT_TOUCH_IMAGE_MODE, normalizeTouchImageMode, touchImageModeLabel } from '../components/touchActionLogic.js'
 import LinsheAutoTextarea from '../components/ui/LinsheAutoTextarea.vue'
 import CollapseTransition from '../components/CollapseTransition.vue'
 import GlobalLoraModal from '../components/GlobalLoraModal.vue'
@@ -1153,8 +1501,17 @@ import LinsheSwitch from '../components/ui/LinsheSwitch.vue'
 import LinsheSlider from '../components/ui/LinsheSlider.vue'
 import GearIcon from '../components/GearIcon.vue'
 import MemoryHealthPanel from '../components/MemoryHealthPanel.vue'
+import TimeControlPanel from '../components/TimeControlPanel.vue'
 import UpdateTag from '../components/UpdateTag.vue'
 import { CHANGELOG_ENTRIES } from '../data/changelog.js'
+import {
+  formatBytes,
+  formatExportSummary,
+  importFailureText,
+  importSuccessText,
+  restoredText,
+  validateImportFile,
+} from '../utils/dataBackup.js'
 
 const settingsStore = useSettingsStore()
 const themeModes = THEME_MODES
@@ -1171,6 +1528,103 @@ const changelogTotal = computed(() => CHANGELOG_ENTRIES.length)
 function openChangelog() {
   if (showChangelogFn) showChangelogFn()
   else toastFn?.('更新说明弹窗未就绪，请刷新页面重试', 'info')
+}
+
+// ── 数据备份：一键导出 / 一键导入 ──
+//
+// 导出：GET /api/data/export 拿二进制 tar.gz，前端直接触发下载（不经过 JSON 层）。
+// 导入：POST /api/data/import 发原始字节，属于覆盖式破坏操作，必须先过二次确认弹窗。
+const exportIncludeConfig = ref(false)
+const exportBusy = ref(false)
+const importBusy = ref(false)
+const exportInfoLoading = ref(false)
+const exportInfo = ref(null)
+/** 导入/导出的结果提示：留在页面上（失败时带上可回滚的备份路径，toast 装不下） */
+const importNotice = ref(null)
+const importFileEl = ref(null)
+/** 选中的文件本体不放 reactive：File 不需要响应式，也避免被代理后传给 fetch */
+let pendingImportFile = null
+const importDialog = reactive({ show: false, fileName: '', fileSize: '' })
+
+/** 一行摘要：角色/消息/群聊/记忆条数 + 预计大小（后端 dbBytes 只是估算上界） */
+const exportInfoText = computed(() => formatExportSummary(exportInfo.value))
+
+async function refreshExportInfo() {
+  exportInfoLoading.value = true
+  try {
+    exportInfo.value = await getDataExportInfo()
+  } catch (err) {
+    // 摘要读不到不影响导出/导入本身，静默降级成「暂无可用数据」
+    exportInfo.value = null
+    console.warn('[数据备份] 读取导出摘要失败:', err?.message || err)
+  } finally {
+    exportInfoLoading.value = false
+  }
+}
+
+async function onExportData() {
+  if (exportBusy.value || importBusy.value) return
+  exportBusy.value = true
+  importNotice.value = null
+  try {
+    const { fileName, bytes } = await downloadDataArchive(exportIncludeConfig.value)
+    toastFn?.(`已导出 ${fileName}（${formatBytes(bytes)}）`, 'success')
+    await refreshExportInfo()
+  } catch (err) {
+    toastFn?.(`导出失败：${err?.message || '未知错误'}`, 'error')
+  } finally {
+    exportBusy.value = false
+  }
+}
+
+/** 触发隐藏 file input 的系统文件选择框（真正的可访问控件是那个 LinsheButton） */
+function pickImportFile() {
+  if (exportBusy.value || importBusy.value) return
+  importFileEl.value?.click()
+}
+
+function onImportFilePicked(event) {
+  const input = event?.target
+  const file = input?.files?.[0] || null
+  // 清空 value，否则连续选同一个文件不会再触发 change
+  if (input) input.value = ''
+
+  // 本地预检：后缀 / 空文件 / 超过 2GB 直接拒绝，不上传
+  const check = validateImportFile(file)
+  if (!check.ok) {
+    importNotice.value = { type: 'error', text: check.reason }
+    toastFn?.(check.reason, 'error')
+    return
+  }
+
+  pendingImportFile = file
+  importDialog.fileName = file.name
+  importDialog.fileSize = formatBytes(file.size)
+  importDialog.show = true
+}
+
+async function confirmImport() {
+  const file = pendingImportFile
+  if (!file || importBusy.value) return
+  importBusy.value = true
+  importNotice.value = null
+  try {
+    const result = await importDataArchive(file)
+    const restored = restoredText(result?.restored)
+    const text = restored ? `${importSuccessText(result)}（${restored}）` : importSuccessText(result)
+    importNotice.value = { type: 'success', text }
+    toastFn?.(text, 'success')
+    importDialog.show = false
+    await refreshExportInfo()
+  } catch (err) {
+    // 500 时后端会带回导入前的自动备份路径：一并写进页面，用户可按它回滚
+    const text = importFailureText(err)
+    importNotice.value = { type: 'error', text }
+    toastFn?.(text, 'error')
+    importDialog.show = false
+  } finally {
+    importBusy.value = false
+  }
 }
 
 // ── 移动端滚动方向感知：下滑隐藏标题，上滑显示 ──
@@ -1208,6 +1662,63 @@ const hiresMaxSize = ref(2000)
 const hiresArtistMode = ref('empty')
 const hiresArtist = ref('')
 const hiresLoraCount = computed(() => (hiresLoras.value || []).filter(l => l.path && l.enabled !== false).length)
+// ── 细化是否按 turbo 参数走（与后端 config.comfyui.hiresTurbo 一致，默认 true）──
+// 打开＝细化阶段强制 CFG 1.0 / 12 步（忽略 hiresSteps/hiresCfg）；关闭＝沿用那两个值。切换即时生效。
+const hiresTurbo = ref(true)
+
+// ── 细化精度三档（D1 用户裁决：精度可选高中低，默认 8 步）──
+// 键 features.hiresQuality（high|medium|low，默认 low）；映射：高 12 步 / 中 10 步 / 低 8 步（都走 turbo CFG 1.0）。
+const HIRES_QUALITY_MODES = [
+  { value: 'high', label: '高' },
+  { value: 'medium', label: '中' },
+  { value: 'low', label: '低' },
+]
+const DEFAULT_HIRES_QUALITY = 'low'
+
+/** 任意输入 → 合法档位；不认识的一律回落默认 low（8 步） */
+function normalizeHiresQuality(value) {
+  return HIRES_QUALITY_MODES.some(mode => mode.value === value) ? value : DEFAULT_HIRES_QUALITY
+}
+
+function hiresQualityLabel(value) {
+  const mode = HIRES_QUALITY_MODES.find(item => item.value === normalizeHiresQuality(value))
+  return mode ? mode.label : ''
+}
+
+// 三档保存：走通用 features PUT；失败把本地档位拨回去，避免「界面改了、后端没存上」
+async function saveHiresQuality(value) {
+  const next = normalizeHiresQuality(value)
+  const previous = normalizeHiresQuality(features.hiresQuality)
+  if (next === previous) return
+  features.hiresQuality = next
+  try {
+    await updateFeatureFlag('hiresQuality', next)
+    toastFn?.('细化精度已改为「' + hiresQualityLabel(next) + '」', 'success')
+  } catch (err) {
+    features.hiresQuality = previous
+    toastFn?.('细化精度保存失败：' + (err.message || '未知错误'), 'error')
+  }
+}
+// turbo 模式下的细化参数，与后端 config.comfyui.hiresTurboSteps / hiresTurboCfg 的默认值保持一致
+const HIRES_TURBO_STEPS = 12
+const HIRES_TURBO_CFG = 1.0
+// 细化摘要显示**实际生效**的参数：turbo 打开时后端会忽略 hiresSteps/hiresCfg；
+// 进阶版还要带上工作流版本，并在「采样跟随原图」时标明采样来源（该模式步数/CFG 取自源工作流）
+const hiresSummary = computed(() => {
+  const lora = hiresLoraCount.value > 0 ? ` · LoRA ${hiresLoraCount.value}` : ''
+  const advancedPrefix = hiresWorkflowMode.value === 'advanced' ? '进阶版 · ' : ''
+  // 2026-10-01：进阶版 + 跟随原图时，步数/CFG **由源工作流决定**（turbo 开着时则由 turbo 参数决定），
+  // 这时再把「35 步 · CFG 5」和「采样跟随原图」并排写出来是两个互斥的说法 —— 二选一，别并列。
+  const followsSource = hiresWorkflowMode.value === 'advanced' && hiresSamplingMode.value === 'source'
+  if (hiresTurbo.value) {
+    // turbo 接管步数/CFG 时仍跟随原图的只剩采样器与调度器，措辞要写准（别写成「采样跟随原图」）
+    return `${advancedPrefix}最长边 ${hiresMaxSize.value} · ${HIRES_TURBO_STEPS} 步 · 重绘 ${hiresDenoise.value} · CFG ${HIRES_TURBO_CFG.toFixed(1)}${lora} · turbo${followsSource ? ' · 采样器跟随原图' : ''}`
+  }
+  if (followsSource) {
+    return `${advancedPrefix}最长边 ${hiresMaxSize.value} · 采样跟随原图 · 重绘 ${hiresDenoise.value}${lora}`
+  }
+  return `${advancedPrefix}最长边 ${hiresMaxSize.value} · ${hiresSteps.value} 步 · 重绘 ${hiresDenoise.value} · CFG ${hiresCfg.value}${lora}`
+})
 // ── 质量提示词（非空覆盖工作流默认，留空不改） ──
 const qualityPrompt = ref('')
 const qualityDialog = reactive({ show: false, text: '' })
@@ -1288,7 +1799,22 @@ const novelaiApiKeySaved = ref(false)
 const novelaiApiKeyCleared = ref(false)
 const connDirty = ref(false)
 const connSaved = ref(false)
-const features = reactive({ emotion: false, memory: false, replyGuesses: false, realtimeAffinityDisplay: false, serializeBackgroundLLM: false, backgroundLLMMaxConcurrency: 3, mergeMessages: false, weather: true })
+const features = reactive({ emotion: false, memory: false, replyGuesses: false, realtimeAffinityDisplay: false, serializeBackgroundLLM: false, backgroundLLMMaxConcurrency: 3, mergeMessages: false, weather: true, intimate: true, intimateBackfill: true, antiRepetition: true, antiRepetitionLock: true, antiRepetitionEscalation: true, antiRepetitionReroll: false, hiresQuality: DEFAULT_HIRES_QUALITY, toys: false, touch: true, touchInstant: true, touchGroupAdult: false, touchImageMode: DEFAULT_TOUCH_IMAGE_MODE, touchBystanderChance: 0.3 })
+
+/**
+ * 亲密度看板两个总开关的读取口径：**fail-closed**。
+ * 它们是"会写档案 / 写流水"的功能，只有后端明确给出布尔 `true` 才算开启：
+ *   · 键缺失（旧后端没有这两个键）→ 关闭。不能沿用 reactive 的初始默认值，否则界面显示"已开启"、
+ *     而后端根本没有这个概念（静默不一致）。
+ *   · 脏值（字符串 `"false"` 之类）→ 关闭，且不把非布尔塞进 LinsheSwitch（否则 Vue prop 类型告警，
+ *     且非空字符串为真会渲染成"开"）。
+ * 依据：task-22 浏览器实机核对的反例 F1（缺键）/ F2（脏值），两条原本都渲染成了"开"。
+ */
+function normalizeIntimateFlags(source) {
+  if (!source || typeof source !== 'object') return
+  features.intimate = source.intimate === true
+  features.intimateBackfill = source.intimateBackfill === true
+}
 const freqSlider = ref(0.5)
 const eventFreqSlider = ref(1)
 const backgroundConcurrency = ref(3)
@@ -1419,10 +1945,26 @@ const llmModelSelectVal = computed({
   },
 })
 const llmThinkingMode = ref('disabled')
+// ── 上下文窗口声明（token）：留空交给服务端从上游模型列表探测 / 用默认值 ──
+// 用字符串持有输入，避免数字输入框在清空过程中把用户输到一半的内容吃掉。
+const llmContextWindowText = ref('')
+const llmContextWindowValid = computed(() => {
+  const raw = String(llmContextWindowText.value ?? '').trim()
+  if (!raw) return true   // 留空 = 自动探测，合法
+  return /^\d+$/.test(raw) && Number(raw) > 0
+})
+/** 保存口径：留空传 null（服务端清掉声明），否则传整数 token */
+const llmContextWindowValue = computed(() => {
+  const raw = String(llmContextWindowText.value ?? '').trim()
+  if (!raw || !llmContextWindowValid.value) return null
+  return Number(raw)
+})
+function applyLlmContextWindow(value) {
+  llmContextWindowText.value = value === null || value === undefined || value === '' ? '' : String(value)
+}
 const thinkingModeOptions = [
   { value: 'enabled', label: '开' },
   { value: 'disabled', label: '关' },
-  { value: 'omit', label: '不传' },
 ]
 const isCustomBaseURL = ref(false)
 // 目前只内置 DeepSeek 一个官方地址，其余服务统一走「自定义…」手填
@@ -1526,6 +2068,7 @@ async function applyRelayConfig(station) {
     llmBaseURL.value = station.url
     llmModel.value = 'deepseek-flash'
     llmThinkingMode.value = 'disabled'
+    applyLlmContextWindow(null)   // 中转站不声明窗口，交给服务端探测
     llmHeadersEnabled.value = false
     llmHeadersText.value = '{}'
     llmExtraBodyEnabled.value = false
@@ -1758,6 +2301,7 @@ async function switchProfile(id) {
         llmBaseURL.value = result.llmConfig.baseURL || 'https://api.deepseek.com'
         llmModel.value = result.llmConfig.model || 'deepseek-chat'
         llmThinkingMode.value = result.llmConfig.thinkingMode || 'disabled'
+        applyLlmContextWindow(result.llmConfig.contextWindow)
         const hasCustom = (result.llmConfig.headers && Object.keys(result.llmConfig.headers).length > 0)
           || (result.llmConfig.extraBody && Object.keys(result.llmConfig.extraBody).length > 0)
         isCustomBaseURL.value = !presetURLs.includes(llmBaseURL.value) || hasCustom
@@ -1774,6 +2318,7 @@ async function switchProfile(id) {
         // 刷新完整的 features 和 concurrency（profile 切换会影响这些）
         const cfg = await getConfig()
         Object.assign(features, cfg.features)
+        normalizeIntimateFlags(cfg.features)
         backgroundConcurrency.value = cfg.features.backgroundLLMMaxConcurrency ?? 3
         freqSlider.value = cfg.features.proactiveChatFreq ?? 0.5
         eventFreqSlider.value = cfg.features.eventFreq ?? 1
@@ -1823,6 +2368,7 @@ async function removeProfile(id) {
       llmBaseURL.value = cfg.llm.baseURL || 'https://api.deepseek.com'
       llmModel.value = cfg.llm.model || 'deepseek-chat'
       llmThinkingMode.value = cfg.llm.thinkingMode || 'disabled'
+      applyLlmContextWindow(cfg.llm.contextWindow)
       const hasCustom = (cfg.llm.headers && Object.keys(cfg.llm.headers).length > 0)
         || (cfg.llm.extraBody && Object.keys(cfg.llm.extraBody).length > 0)
         || cfg.features?.mergeMessages
@@ -1834,6 +2380,7 @@ async function removeProfile(id) {
       llmExtraBodyText.value = cfg.llm.extraBody && Object.keys(cfg.llm.extraBody).length
         ? JSON.stringify(cfg.llm.extraBody, null, 2) : '{}'
       Object.assign(features, cfg.features)
+      normalizeIntimateFlags(cfg.features)
       backgroundConcurrency.value = cfg.features.backgroundLLMMaxConcurrency ?? 3
       settingsStore.setHasApiKey(cfg.llm.hasApiKey)
       llmApiKey.value = ''
@@ -1846,6 +2393,8 @@ async function removeProfile(id) {
 }
 
 onMounted(async () => {
+  // 数据备份摘要独立加载：读失败只影响这一行，不阻塞设置页其它配置
+  refreshExportInfo()
   try {
     const data = await getConfig()
     form.value = {
@@ -1864,6 +2413,7 @@ onMounted(async () => {
     hiresWorkflowMode.value = data.comfy.hiresWorkflowMode === 'advanced' ? 'advanced' : 'basic'
     hiresUpscaleModel.value = data.comfy.hiresUpscaleModel ?? 'RealESRGAN_x4plus_anime_6B.pth'
     hiresLoras.value = data.comfy.hiresLora || []
+    hiresTurbo.value = data.comfy.hiresTurbo ?? true
     hiresSteps.value = data.comfy.hiresSteps ?? 35
     hiresCfg.value = data.comfy.hiresCfg ?? 5
     hiresDenoise.value = data.comfy.hiresDenoise ?? 0.2
@@ -1890,6 +2440,7 @@ onMounted(async () => {
     novelaiApiKeySaved.value = data.comfy.novelaiApiKeySet === true
     settingsStore.setComfySize(data.comfy.width, data.comfy.height)
     Object.assign(features, data.features)
+    normalizeIntimateFlags(data.features)
     freqSlider.value = features.proactiveChatFreq ?? 0.5
     eventFreqSlider.value = features.eventFreq ?? 1
     backgroundConcurrency.value = features.backgroundLLMMaxConcurrency ?? 3
@@ -1908,12 +2459,18 @@ onMounted(async () => {
     llmBaseURL.value = data.llm.baseURL || 'https://api.deepseek.com'
     llmModel.value = data.llm.model || 'deepseek-chat'
     llmThinkingMode.value = data.llm.thinkingMode || 'disabled'
+    applyLlmContextWindow(data.llm.contextWindow)
     const hasCustom = (data.llm.headers && Object.keys(data.llm.headers).length > 0)
       || (data.llm.extraBody && Object.keys(data.llm.extraBody).length > 0)
       || data.features?.mergeMessages
     isCustomBaseURL.value = !presetURLs.includes(llmBaseURL.value) || hasCustom
     llmHeadersEnabled.value = Boolean(data.llm.headers && Object.keys(data.llm.headers).length)
     llmExtraBodyEnabled.value = Boolean(data.llm.extraBody && Object.keys(data.llm.extraBody).length)
+    // 反重复采样参数：null = 不发送该字段（默认）→ 输入框留空
+    antiRepPenaltyPresence.value = data.llm.antiRepetitionPenalty === null || data.llm.antiRepetitionPenalty === undefined
+      ? '' : String(data.llm.antiRepetitionPenalty)
+    antiRepPenaltyFrequency.value = data.llm.antiRepetitionFrequency === null || data.llm.antiRepetitionFrequency === undefined
+      ? '' : String(data.llm.antiRepetitionFrequency)
     llmHeadersText.value = data.llm.headers && Object.keys(data.llm.headers).length
       ? JSON.stringify(data.llm.headers, null, 2) : '{}'
     llmExtraBodyText.value = data.llm.extraBody && Object.keys(data.llm.extraBody).length
@@ -1978,7 +2535,7 @@ function onGlobalLoraSaved(globalList) {
   if (Array.isArray(globalList)) globalLoras.value = globalList
 }
 
-function onHiresFixSaved({ loras, steps, cfg, denoise, maxSize, artistMode, artist, samplingMode, globalLoraScale, sourceBlend, upscaleModel, workflowMode }) {
+function onHiresFixSaved({ loras, steps, cfg, denoise, maxSize, artistMode, artist, samplingMode, globalLoraScale, sourceBlend, upscaleModel, workflowMode, turbo }) {
   if (samplingMode !== undefined) hiresSamplingMode.value = samplingMode
   if (globalLoraScale !== undefined) hiresGlobalLoraScale.value = globalLoraScale
   if (sourceBlend !== undefined) hiresSourceBlend.value = sourceBlend
@@ -1991,6 +2548,22 @@ function onHiresFixSaved({ loras, steps, cfg, denoise, maxSize, artistMode, arti
   if (maxSize !== undefined) hiresMaxSize.value = maxSize
   if (artistMode !== undefined) hiresArtistMode.value = artistMode
   if (artist !== undefined) hiresArtist.value = artist
+  if (turbo !== undefined) hiresTurbo.value = turbo
+}
+
+// 「细化用 turbo 参数」开关：即改即存（改完立刻生效，无需重启）；
+// 保存失败回滚本地开关，避免界面显示与后端实际状态不一致（沿用本页 saveIntimateFeature 的写法）
+async function onHiresTurboToggle(val) {
+  try {
+    await updateHiresSettings({ turboMode: val })
+    hiresTurbo.value = val
+    toastFn?.(val
+      ? `细化已改用 turbo 参数（CFG ${HIRES_TURBO_CFG.toFixed(1)} / ${HIRES_TURBO_STEPS} 步）`
+      : '细化已恢复「设置」里的步数与 CFG', 'success')
+  } catch (err) {
+    hiresTurbo.value = !val
+    toastFn?.(`turbo 参数保存失败：${err.message || '未知错误'}`, 'error')
+  }
 }
 
 function openGlobalLora() {
@@ -2133,6 +2706,8 @@ function buildLlmPayload() {
   if (llmBaseURL.value) payload.baseURL = llmBaseURL.value
   if (llmModel.value) payload.model = llmModel.value
   payload.thinkingMode = llmThinkingMode.value
+  // 上下文窗口：留空传 null，让服务端从上游探测 / 用默认值
+  payload.contextWindow = llmContextWindowValue.value
   payload.headers = isCustomBaseURL.value && llmHeadersEnabled.value
     ? JSON.parse(llmHeadersText.value)
     : {}
@@ -2178,6 +2753,8 @@ async function saveLlmConfig() {
       llmBaseURL.value = result.baseURL || llmBaseURL.value
       llmModel.value = result.model || llmModel.value
       llmThinkingMode.value = result.thinkingMode || 'disabled'
+      // contextWindow 走 result（服务端可能把 null 解析成探测到的真实窗口）
+      if ('contextWindow' in result) applyLlmContextWindow(result.contextWindow)
       llmHeadersEnabled.value = Boolean(result.headers && Object.keys(result.headers).length)
       llmExtraBodyEnabled.value = Boolean(result.extraBody && Object.keys(result.extraBody).length)
       llmHeadersText.value = result.headers && Object.keys(result.headers).length
@@ -2230,6 +2807,175 @@ function applyPreset(p, mode = 'chat') {
 
 async function saveFeature(key, val) {
   await updateFeatureFlag(key, val)
+}
+
+// ── 反重复 / 反钻牛角尖（专题·车轱辘话与钻牛角尖 · 阶段一）──
+// 两个开关都是纯 prompt 增强，保存失败时回滚本地开关（沿用页面既有 toastFn 口径）
+const antiRepFeatureLabels = { antiRepetition: '反车轱辘话', antiRepetitionLock: '反钻牛角尖', antiRepetitionEscalation: '重复时自动加强约束', antiRepetitionReroll: '重写这一轮' }
+
+/**
+ * 功能开关的保存闭环（失败回滚本地开关 + toast）——反重复卡片与动作卡片共用一份，
+ * 免得两处各写一套回滚逻辑。保存失败时把开关拨回去，避免"界面显示开了、后端没存上"的静默不一致。
+ */
+async function saveFeatureWithToast(key, val, label) {
+  try {
+    await updateFeatureFlag(key, val)
+    toastFn?.(val ? `已开启${label}` : `已关闭${label}`, 'success')
+  } catch (err) {
+    features[key] = !val
+    toastFn?.(`${label}保存失败：${err.message || '未知错误'}`, 'error')
+  }
+}
+
+async function saveAntiRepFeature(key, val) {
+  return saveFeatureWithToast(key, val, antiRepFeatureLabels[key] || '设置')
+}
+
+// ── SLG 动作系统（触摸互动 · 专题-SLG动作系统 · 阶段一）──
+const touchFeatureLabels = { touch: '动作系统', touchInstant: '即时反应', touchGroupAdult: '群聊里的敏感动作' }
+
+async function saveTouchFeature(key, val) {
+  return saveFeatureWithToast(key, val, touchFeatureLabels[key] || '设置')
+}
+
+// 动作出图档位（阶段三）：三档选择，键与后端 features.touchImageMode 同口径
+// （always | smart | never，默认 smart）。失败回滚到上一档，避免"界面显示改了、后端没存上"。
+async function saveTouchImageMode(value) {
+  const next = normalizeTouchImageMode(value)
+  const previous = normalizeTouchImageMode(features.touchImageMode)
+  if (next === previous) return
+  features.touchImageMode = next
+  try {
+    await updateFeatureFlag(TOUCH_IMAGE_MODE_KEY, next)
+    toastFn?.('动作出图已改为「' + touchImageModeLabel(next) + '」', 'success')
+  } catch (err) {
+    features.touchImageMode = previous
+    toastFn?.('动作出图保存失败：' + (err.message || '未知错误'), 'error')
+  }
+}
+
+// ── 群聊围观插话概率（task-22）──
+// 契约：features.touchBystanderChance 是 **数字 0~1 = 开启**，'' / null / false = 关闭（退回 task-17 口径）。
+// 写：通用 PUT /api/config/features { key:'touchBystanderChance', value } —— 数字由后端 0~1 夹取，
+//     'off' / null = 关闭，非数字回落 0.3（见 agent-core/src/config.js:549-556）。
+// 失败一律回滚本地值；features 变了会带动下面的 watch 把开关与滑块一起同步回去。
+const BYSTANDER_DEFAULT_PERCENT = 30
+
+/** 0~1（或 '' / null / false）→ 整数百分比；非法 / 关闭都给默认 30 */
+function chanceToPercent(value) {
+  if (value === '' || value === null || value === undefined || value === false) return BYSTANDER_DEFAULT_PERCENT
+  const n = Number(value)
+  if (!Number.isFinite(n)) return BYSTANDER_DEFAULT_PERCENT
+  return Math.round(Math.min(1, Math.max(0, n)) * 100)
+}
+
+/** 任意输入 → 0~100 整数百分比（滑块的值已经是百分比，别拿 chanceToPercent 再乘一遍）；非数字回落默认 30 */
+function clampPercent(value) {
+  if (value === '' || value === null || value === undefined || value === false) return BYSTANDER_DEFAULT_PERCENT
+  const n = Number(value)
+  if (!Number.isFinite(n)) return BYSTANDER_DEFAULT_PERCENT
+  return Math.round(Math.min(100, Math.max(0, n)))
+}
+
+const bystanderEnabled = ref(true)
+const bystanderPercent = ref(BYSTANDER_DEFAULT_PERCENT)
+
+// 载入 / 回滚后同步本地开关与滑块；**关闭时保留上次的百分比**，方便再打开
+watch(() => features.touchBystanderChance, (value) => {
+  const closed = value === '' || value === null || value === undefined || value === false
+  bystanderEnabled.value = !closed
+  if (!closed) bystanderPercent.value = chanceToPercent(value)
+}, { immediate: true })
+
+async function saveBystanderEnabled(enabled) {
+  const previous = features.touchBystanderChance
+  const pct = clampPercent(bystanderPercent.value)
+  const next = enabled ? (pct / 100) : 'off'
+  features.touchBystanderChance = next
+  try {
+    await updateFeatureFlag('touchBystanderChance', next)
+    toastFn?.(enabled
+      ? '已开启群聊围观插话（' + pct + '%）'
+      : '已关闭群聊围观插话：这轮其他成员都不发言', 'success')
+  } catch (err) {
+    features.touchBystanderChance = previous
+    toastFn?.('围观插话保存失败：' + (err.message || '未知错误'), 'error')
+  }
+}
+
+async function saveBystanderChance(percent) {
+  // 关闭状态下不发送概率（关闭语义由 'off' 表达）
+  if (!bystanderEnabled.value) return
+  const pct = clampPercent(percent)
+  const previous = features.touchBystanderChance
+  if (chanceToPercent(previous) === pct) return
+  features.touchBystanderChance = pct / 100
+  try {
+    await updateFeatureFlag('touchBystanderChance', pct / 100)
+    toastFn?.('围观插话概率已改为 ' + pct + '%', 'success')
+  } catch (err) {
+    features.touchBystanderChance = previous
+    toastFn?.('围观插话保存失败：' + (err.message || '未知错误'), 'error')
+  }
+}
+
+// 重复惩罚参数（L3）：留空 = 不发送该字段。字符串与 number 都接受，范围 -2 ~ 2。
+const antiRepPenaltyPresence = ref('')
+const antiRepPenaltyFrequency = ref('')
+const antiRepPenaltySaving = ref(false)
+const antiRepPenaltySaved = ref(false)
+const antiRepPenaltyError = ref('')
+
+function parsePenaltyInput(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return { valid: true, value: null }
+  const n = Number(text)
+  if (!Number.isFinite(n) || n < -2 || n > 2) return { valid: false, value: null }
+  return { valid: true, value: n }
+}
+
+const antiRepPenaltyPresenceValid = computed(() => parsePenaltyInput(antiRepPenaltyPresence.value).valid)
+const antiRepPenaltyFrequencyValid = computed(() => parsePenaltyInput(antiRepPenaltyFrequency.value).valid)
+const antiRepPenaltyValid = computed(() => antiRepPenaltyPresenceValid.value && antiRepPenaltyFrequencyValid.value)
+
+async function onAntiRepPenaltySave() {
+  antiRepPenaltyError.value = ''
+  const presence = parsePenaltyInput(antiRepPenaltyPresence.value)
+  const frequency = parsePenaltyInput(antiRepPenaltyFrequency.value)
+  if (!presence.valid || !frequency.valid) {
+    antiRepPenaltyError.value = '两个参数都必须是 -2 ~ 2 之间的数字，留空表示不发送'
+    return
+  }
+  antiRepPenaltySaving.value = true
+  try {
+    const result = await updateAntiRepetitionPenalty({ presence: presence.value, frequency: frequency.value })
+    const savedPresence = result?.antiRepetitionPenalty
+    const savedFrequency = result?.antiRepetitionFrequency
+    antiRepPenaltyPresence.value = savedPresence === null || savedPresence === undefined ? '' : String(savedPresence)
+    antiRepPenaltyFrequency.value = savedFrequency === null || savedFrequency === undefined ? '' : String(savedFrequency)
+    antiRepPenaltySaved.value = true
+    setTimeout(() => { antiRepPenaltySaved.value = false }, 2000)
+  } catch (err) {
+    antiRepPenaltyError.value = `保存失败：${err.message || '未知错误'}`
+  } finally {
+    antiRepPenaltySaving.value = false
+  }
+}
+
+// 亲密度看板 / 历史对话回填两个开关的中文名（保存结果提示复用）
+const intimateFeatureLabels = { intimate: '亲密度看板', intimateBackfill: '历史对话回填' }
+
+// 看板开关关闭是有实际副作用的操作（停止自动记账），所以单独处理：
+// 保存失败时回滚本地开关，避免界面显示与后端实际状态不一致（沿用页面既有 toastFn）
+async function saveIntimateFeature(key, val) {
+  const label = intimateFeatureLabels[key] || '设置'
+  try {
+    await updateFeatureFlag(key, val)
+    toastFn?.(val ? `已开启${label}` : `已关闭${label}`, 'success')
+  } catch (err) {
+    features[key] = !val
+    toastFn?.(`${label}保存失败：${err.message || '未知错误'}`, 'error')
+  }
 }
 
 // ── 深度思考（测试版）：开关在 settings store 持久化，聊天页实时读取 ──
@@ -2595,6 +3341,93 @@ function resetTestPrompts() {
 
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .memory-settings-card { gap: 0; }
+
+/* ── 程序时间（面板自带皮肤，这里只负责与卡片头的间距） ── */
+.time-control-card .memory-settings-header { margin-bottom: 12px; }
+
+/* ── 数据备份（一键导出 / 一键导入） ── */
+.data-backup-card .toggle-row { border-bottom: none; }
+.data-backup-info {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 2px;
+}
+.data-backup-info-label { font-size: 12px; color: var(--text-secondary); flex-shrink: 0; }
+.data-backup-info-text {
+  font-size: 13px;
+  color: var(--text-bright);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+}
+.data-backup-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-top: 14px;
+}
+.data-backup-tip {
+  flex: 1;
+  min-width: 200px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+.data-backup-notice {
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.7;
+  word-break: break-all;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--bg-sunken);
+  color: var(--text-primary);
+}
+.data-backup-notice.is-success {
+  border-color: color-mix(in srgb, var(--success) 35%, var(--border));
+  color: var(--success);
+}
+.data-backup-notice.is-error {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  color: var(--danger);
+}
+/* 导入结果提示的出现 / 消失：与全局口径一致的 0.3s 淡入淡出 */
+.backup-notice-fade-enter-active,
+.backup-notice-fade-leave-active {
+  transition: opacity 0.3s var(--ease-standard);
+}
+.backup-notice-fade-enter-from,
+.backup-notice-fade-leave-to { opacity: 0; }
+/* 隐藏的文件选择器：不进布局、不进 tab 序列（可点入口是旁边的 LinsheButton） */
+.data-backup-file {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.data-backup-modal-line {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.75;
+  margin: 0 0 8px;
+}
+.data-backup-modal-line code {
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  color: var(--text-bright);
+}
+.data-backup-modal-size { color: var(--text-secondary); font-size: 12px; }
 .maibot-settings-card .memory-settings-entry { margin-top: 14px; }
 .memory-settings-header h3 { margin-bottom: 4px; }
 .memory-settings-header p {
@@ -2759,6 +3592,14 @@ function resetTestPrompts() {
 .hiresfix-desc {
   font-size: 12px; color: var(--text-secondary); margin-top: 2px;
 }
+/* ── turbo 参数开关行（与上一行同区，靠上边框分隔）── */
+.hiresfix-quality-tabs { flex-shrink: 0; }
+.hiresfix-turbo-row {
+  margin-top: 14px; padding-top: 14px;
+  border-top: 1px dashed var(--border);
+  align-items: flex-start;
+}
+.hiresfix-turbo-title { font-size: 13px; font-weight: 600; color: var(--text-bright); }
 .hiresfix-summary { font-size: 12px; color: var(--text-secondary); }
 .hiresfix-link, .quality-link {
   font-size: 13px;
@@ -2845,6 +3686,13 @@ function resetTestPrompts() {
 
 .toggle-row { display: flex; gap: 14px; justify-content: space-between; align-items: center; padding: 14px 0; border-bottom: 1px solid var(--glass-border); }
 .toggle-row:last-child { border-bottom: none; }
+/* 动作出图档位：窄屏让三档换到下一行，别把说明文字挤成一列 */
+.touch-image-mode-row { flex-wrap: wrap; }
+.touch-image-mode-tabs { flex-shrink: 0; }
+/* 围观插话概率：滑块撑满，右侧百分比定宽不跳 */
+.bystander-row { display: flex; align-items: center; gap: 12px; padding: 0 0 14px; }
+.bystander-slider { flex: 1; min-width: 0; }
+.bystander-value { width: 44px; flex-shrink: 0; text-align: right; font-size: 12px; color: var(--text-secondary); }
 .tl { font-size: 14px; font-weight: 500; color: var(--text-bright); }
 /* 测试版小标签：珊瑚描边弱强调 */
 .beta-tag {
@@ -2860,6 +3708,18 @@ function resetTestPrompts() {
   vertical-align: 1px;
 }
 .td { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+/* ── 反重复与话题推进（专题·车轱辘话与钻牛角尖 · 阶段一）──
+   只做本卡内部排版，控件皮肤一律走 Linshe 组件与既有 token，不覆盖组件样式 */
+.anti-rep-card .anti-rep-penalty {
+  display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; align-items: flex-start;
+  padding: 14px 0 0; margin-top: 2px; border-top: 1px solid var(--glass-border);
+}
+.anti-rep-card .anti-rep-penalty-copy { flex: 1 1 260px; min-width: 220px; }
+.anti-rep-card .anti-rep-penalty-inputs { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+.anti-rep-field { display: flex; flex-direction: column; gap: 4px; }
+.anti-rep-field-label { font-size: 11px; color: var(--text-secondary); }
+.anti-rep-card .anti-rep-input { width: 92px; }
 
 .freq-control {
   display: flex; align-items: center; gap: 10px; flex-shrink: 0;
@@ -3178,6 +4038,8 @@ function resetTestPrompts() {
   white-space: nowrap;
 }
 .model-fetch-error { margin-top: -8px; margin-bottom: 14px; color: var(--danger); font-size: 12px; line-height: 1.5; }
+/* 上下文窗口：输入框已有 .fi 的底部留白，说明行只需贴住上一条 */
+.llm-context-window-hint { margin-top: -8px; margin-bottom: 14px; }
 .thinking-setting { min-width: 0; }
 .thinking-options {
   position: relative;

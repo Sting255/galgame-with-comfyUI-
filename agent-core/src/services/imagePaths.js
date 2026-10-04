@@ -25,6 +25,10 @@ export const IMAGE_CATEGORIES = {
   expression_standing: { dir: 'expression_standing', label: '表情立绘' },
   newspaper: { dir: 'newspaper', label: '报纸' }, // 《邻舍日报》新闻配图
   town_service: { dir: 'town_service', label: '小镇生活' }, // 打工与服务共用此目录
+  // 2026-10-01 补：`POST /api/images/generate`（聊天之外的独立生图入口）以前**不落盘** ——
+  // 图留在 ComfyUI 自己的 temp/ 里、`output_paths` 存的是裸文件名，而那个目录会被 ComfyUI 清理、
+  // 前端按 `/images/<名>` 取又必然 404。现在与其它链路同一口径落进自己的目录。
+  standalone: { dir: 'standalone', label: '生图' },
 };
 
 export const LEGACY_CATEGORY = 'history';

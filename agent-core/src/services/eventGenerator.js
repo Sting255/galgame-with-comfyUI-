@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 生活片段生成器
  *
  * EVENT_TYPES 描述的是"角色今天的生活进入了哪一种状态"，不是"发生了什么剧情"。
@@ -18,7 +18,7 @@ import { appendOathRing } from './oathUtils.js';
 import { chatSync } from '../llm/llm-client.js';
 import { generateImageRaw } from './imageSkill.js';
 import { charArtistOverrideWithFallback } from './characterImageOpts.js';
-import { recordCompletedImageTask } from './imageTaskRecorder.js';
+import { recordCompletedImageTask, recordFailedImageTask } from './imageTaskRecorder.js';
 import { saveBase64Image } from './imagePaths.js';
 import { config } from '../config.js';
 import { createCharacterTownLifeContext } from './characterTownLifeContext.js';
@@ -26,11 +26,20 @@ import { createTownActorRegistry } from './town/townActorRegistry.js';
 import { broadcastNewEvent, broadcastEventUpdate, broadcastEventConclusion } from './eventNotificationBus.js';
 import { applyMemoryActions, softDeleteMemory } from './memory/memoryRepository.js';
 import { getMemorySettings } from './memory/memoryConfig.js';
-import { getCurrentActivity } from './scheduleManager.js';
+import { getCurrentActivity, syncEventSchedule } from './scheduleManager.js';
+import { captureEventSchedule } from './eventSchedule.js';
 import { getTimeTag, getLightNoteWithWeather } from './timeLight.js';
 import { matchAll } from './characterSearch.js';
 import { buildCharacterPersona } from './characterPersona.js';
 import { getWorldIntegrationRule } from '../builtinRules.js';
+// ⚠️ 这一行**本地 import** 不能删：下面 533 / 1042 / 1346 行都在本文件里直接调用 extractFirstJson，
+// 而文件末尾那句 `export { extractFirstJson } from './jsonExtract.js'` 只是**再导出**、
+// **不会**产生本地绑定 ⇒ 少了这行就是 `extractFirstJson is not defined`，
+// 真机表现：多人事件生成直接失败（日志里 eventGen + eventScheduler 两条 error，
+// 而模型其实已经回了完整 JSON —— 白瞎一次调用）。
+import { extractFirstJson } from './jsonExtract.js';
+// 亲密看板：奇遇场景记账（零 LLM 的确定性归类；幂等锚点用显式 sourceUid，见 recordIntimateForEvent）
+import { classifyPromptTags, recordIntimateActs, tagsFromPromptString } from './intimateService.js';
 
 // ── 生活片段类型库（事件类型存于 event_types 表，见 db/index.js 的 seedEventLibraries）──
 // 每个类型描述的是"角色今天的生活进入了哪一种状态"，不是"发生了什么剧情"。
@@ -354,11 +363,12 @@ export async function generateEvent(character, options = {}) {
     : '';
 
   // 日程注入：获取角色当前活动，让事件起点与当前活动自然衔接
+  const scheduleBinding = captureEventSchedule(character.id, now, db);
   let scheduleContextLine = '';
   let scheduleSystemBlock = '';
   try {
     if (config.features.schedule !== false) {
-      const currentActivity = getCurrentActivity(character.id);
+      const currentActivity = scheduleBinding?.activity || getCurrentActivity(character.id);
       if (currentActivity && currentActivity.activity !== '自由时间') {
         scheduleContextLine = `此时${displayName}正在${currentActivity.location}${currentActivity.activity}。`;
         const descPart = currentActivity.description ? `——${currentActivity.description}` : '';
@@ -398,12 +408,19 @@ ${multiPerson.otherPersona}`;
 
   const formatPrompt = `请严格按照以下 JSON 格式输出，不要任何解释或额外文字：
 
+【prompt 字段的写作规范】
+${imagePromptInstruction}${weatherHint}${multiPersonImageNote}
+
+⚠️ 上面这段是**规范**，不是内容：照它的要求**自己写一段画面描述**填进 prompt 字段，
+**绝对不要把它原文抄进 JSON**，也不要出现「Describe the image」「Follow this progression」
+「Scene Setting」「Environment & Props」「Hard Rules」这类规范字样。
+
 {
   "title": "事件标题事件标题（≤8字，口语感叹。从你刚写完的事件场景里抓最戳人的那个瞬间，用角色第一反应的口吻喊出来——不要给事件'取名'，是替角色喊出ta看到/发现/意识到时脑子里蹦出来的那句话。正确：包裹在动……|谁寄来的？！|钥匙怎么还在她这里。错误：神秘包裹降临|意外来客——这些是在概括事件类型。禁止万能感叹'天哪''不是吧''怎么会'——必须带上这个事件的具体信息点）",
   "description": "场景叙述（80-150字。
 不要像讲故事，而像镜头正在发生：
 - 行动需要符合当前天气和时间，但禁止直接提及天气时间",
-  "prompt": "${imagePromptInstruction}${weatherHint}${multiPersonImageNote}",
+  "prompt": "（这里填**你写好的那一整段英文画面描述**：按上面的规范，写清场景环境、谁在做什么、道具与光线氛围；角色名写成 character(series) 并在首次出现时带外观锚点。整段连贯英文，严禁中文，严禁照抄上面的规范原文。示例：A dim dormitory room at night, a girl with long silver-grey hair in a high ponytail lies back on the bed while another girl in a blue blouse kneels beside her holding a camera, warm bedside lamp light mixed with a cool screen glow, conveying an atmosphere of intimate chaos）",
   "choiceA": "选项A（具体行动，8-15字。符合${displayName}的性格和当下处境）",
   "choiceB": "选项B（与A形成真正的行动对比——不符合${displayName}的个性，会将事件往意料之外但符合<world_setting>的情况发展。8-15字）"
 }
@@ -520,7 +537,7 @@ ${directorPrompt}`
     }
   }
   try {
-    rawResult = await chatSync(msgs, { temperature: 0.7, max_tokens: 4096, response_format: { type: 'json_object' }, label: '奇遇生成' });
+    rawResult = await (options.llm?.chatSync || chatSync)(msgs, { temperature: 0.7, max_tokens: 4096, response_format: { type: 'json_object' }, label: '奇遇生成' });
     const jsonStr = extractFirstJson(rawResult);
     if (!jsonStr) throw new Error('No JSON found in LLM response');
     eventData = JSON.parse(repairJson(jsonStr));
@@ -548,9 +565,12 @@ ${directorPrompt}`
 
   const originalEventPrompt = eventData.prompt;
   let imageUrl = null;
+  // §3.5：出图失败的原因（成功时保持 null）。它会被写进 character_events.error_message，
+  // 前端据此把「配图生成中…」换成真实原因 + 补图入口。
+  let imageError = null;
   try {
     const charArtist = charArtistOverrideWithFallback(character, otherChars);
-    const genResult = await generateImageRaw(eventData.prompt, {
+    const genResult = await (options.image?.generateImageRaw || generateImageRaw)(eventData.prompt, {
       ragQuery: eventData.description,
       artist: charArtist !== null ? charArtist : config.comfyui.eventArtist,
       width: config.comfyui.eventWidth,
@@ -578,9 +598,31 @@ ${directorPrompt}`
       console.log(`[eventGen] Image generated for ${character.display_name}: ${imageUrl}`);
     } else {
       console.warn(`[eventGen] Image generation returned no images for ${character.display_name}`);
+      imageError = genResult.error || 'ComfyUI 未返回图片';
+      // 2026-10-01：失败也要在库里留痕，否则「没触发 / 失败 / 文件丢了」事后分不出来
+      recordFailedImageTask({
+        conversationId: `char_${character.id}_events`,
+        promptOriginal: originalEventPrompt,
+        promptRefined: eventData.prompt,
+        errorMessage: genResult.error || 'ComfyUI 未返回图片',
+        style: charArtist !== null ? charArtist : config.comfyui.eventArtist,
+        resolution: `${config.comfyui.eventWidth}x${config.comfyui.eventHeight}`,
+        workflowTemplate: genResult.wfMode || null,
+        db,
+      });
     }
   } catch (err) {
     console.error(`[eventGen] Image generation failed for ${character.display_name}:`, err.message);
+    imageError = err.message;
+    recordFailedImageTask({
+      conversationId: `char_${character.id}_events`,
+      promptOriginal: originalEventPrompt,
+      promptRefined: eventData.prompt,
+      errorMessage: err.message,
+      style: charArtist !== null ? charArtist : config.comfyui.eventArtist,
+      resolution: `${config.comfyui.eventWidth}x${config.comfyui.eventHeight}`,
+      db,
+    });
     // 无图片也继续
   }
 
@@ -593,8 +635,24 @@ ${directorPrompt}`
     image: imageUrl,
     // 存储多人模式信息，供后续分支生成时复用
     multiPerson: multiPerson ? { otherId: multiPerson.otherId, otherName: multiPerson.otherName, otherPersona: multiPerson.otherPersona, relDesc: multiPerson.relDesc } : null,
+    scheduleBinding,
   }];
-  const expiresAt = new Date(now.getTime() + eventType.durationMin * 60 * 1000).toISOString();
+  /**
+   * TTL 锚点 = **写库时刻**，不是函数开头的 `now`。
+   *
+   * 2026-10-01 真机日志实证（用户玩了一整轮的那份 9MB 日志）：
+   * ```
+   * 05:15:12.614 [log] Generating event for 云璃          ← 任务开始
+   * 05:47:41.193 [log] Event created for 云璃 (expires=2026-10-01T05:45:12.614Z)  ← 32 分钟后才写库
+   * 05:47:42.758 [log] Event expired (engaged=0)          ← 1.5 秒后过期
+   * ```
+   * `expires` 的秒/毫秒与"任务开始时刻"逐位相同 ⇒ 原来用的是函数开头的 `now`，
+   * 而中间隔着 LLM + 出图（正是图片队列被堵到 52 分钟那段时间）：
+   * **任务慢 ⇒ 事件生下来就已经过期**，玩家一眼都没看到就没了。
+   * 现在按写库时刻算，生成再慢也只是"晚一点开始计时"，不会再产出死胎。
+   */
+  const createdAtMs = Date.now();
+  const expiresAt = new Date(createdAtMs + eventType.durationMin * 60 * 1000).toISOString();
 
   // 生成期间可能有另一个入口先完成；写入与镇上邀请的关联在同一事务内提交。
   const eventId = db.transaction(() => {
@@ -603,8 +661,8 @@ ${directorPrompt}`
       throw new Error('ALREADY_ACTIVE_EVENT');
     }
     const insertResult = db.prepare(`
-    INSERT INTO character_events (character_id, event_type_key, status, title, description, image, prompt, style, resolution, choice_a, choice_b, choice_c_label, current_branch, max_branches, choice_history, expires_at)
-    VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+    INSERT INTO character_events (character_id, event_type_key, status, title, description, image, prompt, style, resolution, choice_a, choice_b, choice_c_label, current_branch, max_branches, choice_history, expires_at, error_message)
+    VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
   `).run(
     character.id,
     eventType.key,
@@ -618,7 +676,11 @@ ${directorPrompt}`
     eventData.choiceB,
     eventData.choiceCLabel || '自由行动',
     JSON.stringify(initialChoiceEntry),
-    toSQLite(expiresAt)
+    toSQLite(expiresAt),
+    // §3.5（2026-10-01）：把出图失败的原因**落库**。以前这个列全库没人写，
+    // 于是前端分不出「还在生成」和「生成失败」—— 一律显示「配图生成中…」，
+    // 用户等一张永远不会来的图，也没有任何补图入口。
+    imageError
   );
     const id = Number(insertResult.lastInsertRowid);
     options.afterPersist?.(id);
@@ -627,6 +689,7 @@ ${directorPrompt}`
 
   // 7. 构建返回数据
   const event = db.prepare(`SELECT * FROM character_events WHERE id = ?`).get(eventId);
+  syncEventSchedule(event);
 
   // 8. SSE 广播
   broadcastNewEvent({
@@ -651,9 +714,110 @@ ${directorPrompt}`
 }
 
 /**
+ * 给**已有**奇遇补一张配图（§3.5，2026-10-01）
+ *
+ * 为什么需要它：奇遇的配图是在创建时一次性生成的（`generateEvent` 里那段）。一旦那次失败
+ * （ComfyUI 没开、模型没加载完、显存不足……），这条奇遇就永远没有图，而前端只会显示
+ * 「配图生成中…」——用户既不知道失败了，也没有任何补救入口，只能删掉这条奇遇重开。
+ *
+ * 复用同一条链路，不另造实现：行里存着当时的 `prompt` / `style` / `resolution`，
+ * 拿它们再走一次 `generateImageRaw` + `saveBase64Image('events')`，
+ * 成功就更新 `image` 并清掉 `error_message`，失败就把原因写进 `error_message` 供前端显示。
+ *
+ * @param {number} eventId
+ * @param {object} [opts]
+ * @param {object} [opts.db]        库句柄（测试可注入）
+ * @param {Function} [opts.generate] 生图函数（默认 generateImageRaw；测试注入假实现，
+ *                                   否则单测会真去连 ComfyUI，跑得又慢又不稳）
+ * @returns {Promise<{ok: boolean, image?: string, error?: string, code?: string}>}
+ */
+export async function regenerateEventImage(eventId, { db = getDb(), generate = generateImageRaw } = {}) {
+  const row = db.prepare(`
+    SELECT ce.*, c.display_name, c.loras, c.artist_override, c.custom_workflow
+    FROM character_events ce
+    JOIN characters c ON c.id = ce.character_id
+    WHERE ce.id = ?
+  `).get(eventId);
+  if (!row) return { ok: false, code: 'not_found', error: '这条奇遇不存在' };
+  if (!row.prompt || !String(row.prompt).trim()) {
+    return { ok: false, code: 'no_prompt', error: '这条奇遇没有存下提示词，无法补图（只能重新生成一条奇遇）' };
+  }
+
+  // 分辨率：行里存的是 "宽x高"，解析不出来就回落到当前配置
+  let width = config.comfyui.eventWidth;
+  let height = config.comfyui.eventHeight;
+  const m = /^(\d{2,5})\s*[x×]\s*(\d{2,5})$/.exec(String(row.resolution || '').trim());
+  if (m) { width = Number(m[1]); height = Number(m[2]); }
+  const artist = row.style || row.artist_override || config.comfyui.eventArtist;
+
+  const loras = _parseCharLoras(row.loras);
+  const originalPrompt = row.prompt;
+
+  try {
+    const genResult = await generate(row.prompt, {
+      ragQuery: row.description || '',
+      artist,
+      width,
+      height,
+      scene: 'events',
+      priority: 'high',
+      loras,
+      ...(row.custom_workflow ? { customWorkflow: row.custom_workflow } : {}),
+    });
+
+    if (genResult.success && genResult.images?.length > 0) {
+      const img = genResult.images[0];
+      const filename = `event_${Date.now()}_${img.filename || 'comfy.png'}`;
+      const imageUrl = saveBase64Image('events', filename, img.base64);
+      const refined = genResult.promptRefined || originalPrompt;
+      db.prepare(`UPDATE character_events SET image = ?, prompt = ?, error_message = NULL WHERE id = ?`)
+        .run(imageUrl, refined, eventId);
+      recordCompletedImageTask({
+        conversationId: `char_${row.character_id}_events`,
+        promptOriginal: originalPrompt,
+        promptRefined: refined,
+        outputPaths: [imageUrl],
+        style: artist,
+        resolution: `${width}x${height}`,
+        workflowTemplate: genResult.wfMode,
+        db,
+      });
+      console.log(`[eventGen] 补图成功 event#${eventId} -> ${imageUrl}`);
+      return { ok: true, image: imageUrl };
+    }
+
+    const reason = genResult.error || 'ComfyUI 未返回图片';
+    db.prepare(`UPDATE character_events SET error_message = ? WHERE id = ?`).run(reason, eventId);
+    recordFailedImageTask({
+      conversationId: `char_${row.character_id}_events`,
+      promptOriginal: originalPrompt,
+      promptRefined: row.prompt,
+      errorMessage: reason,
+      style: artist,
+      resolution: `${width}x${height}`,
+      workflowTemplate: genResult.wfMode || null,
+      db,
+    });
+    return { ok: false, code: 'no_images', error: reason };
+  } catch (err) {
+    db.prepare(`UPDATE character_events SET error_message = ? WHERE id = ?`).run(err.message, eventId);
+    recordFailedImageTask({
+      conversationId: `char_${row.character_id}_events`,
+      promptOriginal: originalPrompt,
+      promptRefined: row.prompt,
+      errorMessage: err.message,
+      style: artist,
+      resolution: `${width}x${height}`,
+      db,
+    });
+    return { ok: false, code: 'threw', error: err.message };
+  }
+}
+
+/**
  * 生成下一步分支
  */
-export async function generateNextBranch(character, event, choice) {
+export async function generateNextBranch(character, event, choice, deps = {}) {
   const db = getDb();
   const now = new Date();
   const branchTimeExtensionMinutes = 5;
@@ -677,6 +841,7 @@ export async function generateNextBranch(character, event, choice) {
     return null;
   }
 
+  try {
   // 用户已成功提交一个有效分支选择，立即延长倒计时，避免分支生成期间事件到期。
   db.prepare(`
     UPDATE character_events
@@ -686,6 +851,8 @@ export async function generateNextBranch(character, event, choice) {
   event.expires_at = db.prepare(
     `SELECT expires_at FROM character_events WHERE id = ?`
   ).get(event.id).expires_at;
+  // 仍延长开场日程，不能在跨过边界后改成延长下一个活动。
+  syncEventSchedule(event);
 
   // 2. 加载关系网
   const relationships = db.prepare(`
@@ -721,7 +888,6 @@ export async function generateNextBranch(character, event, choice) {
   const choiceExtra = choice.choice !== 'C' && choice.customText ? '——' + choice.customText : '';
 
   // 4. LLM 生成下一步（try-catch 确保失败时清除 processing 标记）
-  try {
   const worldSetting2 = getWorldSetting();
   const jailbreakPrompt = worldSetting2
     ? getSystemRulesWithWorld({ roleplay: false })
@@ -801,6 +967,13 @@ ${multiPerson2.otherPersona}`;
 
   const formatPrompt2 = `请严格按照以下 JSON 格式输出，不要任何解释或额外文字：
 
+【prompt 字段的写作规范】
+${branchImagePromptInstruction}${weatherHint}${multiPersonImageNote2}
+
+⚠️ 上面这段是**规范**，不是内容：照它的要求**自己写一段画面描述**填进 prompt 字段，
+**绝对不要把它原文抄进 JSON**，也不要出现「Describe the image」「Follow this progression」
+「Scene Setting」「Environment & Props」「Hard Rules」这类规范字样。
+
 {
   "description": "选择后的场景叙述场景叙述，承接上一个选择的结果，展现角色此刻的即时感受和新出现的局面。场景转折要出乎意料但又在情理之中（80-150字）。
 
@@ -809,7 +982,7 @@ ${multiPerson2.otherPersona}`;
 不要像讲故事，而像镜头正在发生：
 - 结尾停在『必须做出选择之前』，留下悬念，不提前进入结果。
 - 行动需要符合当前天气和时间，但禁止直接提及天气时间。",
-  "prompt": "${branchImagePromptInstruction}${weatherHint}${multiPersonImageNote2}",
+  "prompt": "（这里填**你写好的那一整段英文画面描述**：按上面的规范，写清承接这次选择之后的场景、谁在做什么、道具与光线氛围；整段连贯英文，严禁中文，严禁照抄上面的规范原文）",
   "choiceA": "新选项A（具体行动。必须符合${displayName2}的个性——是ta此刻真的会做出来的事。8-15字）",
   "choiceB": "新选项B（与A形成真正的行动对比——不符合${displayName2}的个性，会将事件往意料之外但符合<world_setting>的情况发展。8-15字）"
 }`;
@@ -877,7 +1050,7 @@ ${directorPrompt2}${prevSceneBlock}`
   for (let attempt = 1; attempt <= MAX_BRANCH_ATTEMPTS; attempt++) {
     rawBranchResult = '';
     try {
-      rawBranchResult = await chatSync(msgs, { temperature: 0.7, max_tokens: 4096, response_format: { type: 'json_object' }, label: '事件分支' });
+      rawBranchResult = await (deps.llm?.chatSync || chatSync)(msgs, { temperature: 0.7, max_tokens: 4096, response_format: { type: 'json_object' }, label: '事件分支' });
       const jsonStr = extractFirstJson(rawBranchResult);
       if (!jsonStr) throw new Error('No JSON found in LLM response');
       const parsed = JSON.parse(repairJson(jsonStr));
@@ -944,7 +1117,7 @@ ${directorPrompt2}${prevSceneBlock}`
   let imageUrl = null;
   try {
     const charArtist = charArtistOverrideWithFallback(character, branchOtherChars);
-    const genResult = await generateImageRaw(branchData.prompt, {
+    const genResult = await (deps.image?.generateImageRaw || generateImageRaw)(branchData.prompt, {
       ragQuery: branchData.description || event.description,
       artist: charArtist !== null ? charArtist : config.comfyui.eventArtist,
       width: config.comfyui.eventWidth,
@@ -969,9 +1142,30 @@ ${directorPrompt2}${prevSceneBlock}`
         db,
       });
       console.log(`[eventGen] Branch image generated: ${imageUrl}`);
+    } else {
+      console.warn(`[eventGen] Branch image generation returned no images for ${character.display_name}`);
+      recordFailedImageTask({
+        conversationId: `char_${character.id}_event_${event.id}_branch_${event.current_branch + 1}`,
+        promptOriginal: originalBranchPrompt,
+        promptRefined: branchData.prompt,
+        errorMessage: genResult.error || 'ComfyUI 未返回图片',
+        style: charArtist !== null ? charArtist : config.comfyui.eventArtist,
+        resolution: `${config.comfyui.eventWidth}x${config.comfyui.eventHeight}`,
+        workflowTemplate: genResult.wfMode || null,
+        db,
+      });
     }
   } catch (err) {
     console.error(`[eventGen] Branch image generation failed:`, err.message);
+    recordFailedImageTask({
+      conversationId: `char_${character.id}_event_${event.id}_branch_${event.current_branch + 1}`,
+      promptOriginal: originalBranchPrompt,
+      promptRefined: branchData.prompt,
+      errorMessage: err.message,
+      style: charArtist !== null ? charArtist : config.comfyui.eventArtist,
+      resolution: `${config.comfyui.eventWidth}x${config.comfyui.eventHeight}`,
+      db,
+    });
   }
 
   // 6. 更新 choice_history 和 summary
@@ -1030,6 +1224,55 @@ ${directorPrompt2}${prevSceneBlock}`
     db.prepare(`UPDATE character_events SET processing = 0 WHERE id = ?`).run(event.id);
     throw err;
   }
+}
+
+/**
+ * 亲密看板：把一场奇遇记进行为流水（scene='event'），零额外 LLM 调用。
+ *
+ * **幂等锚点为什么不用 raw_id**：奇遇没有 raw_messages 行，而 raw_id 在本项目里语义固定指向
+ * raw_messages.id —— 塞事件 id 进去会污染聊天链路的撤回：撤回一轮按 raw_id 删流水
+ * （chat.js → rollbackIntimateByRawId），事件流水会被误删。
+ * 所以这里走 recordIntimateActs 的显式 sourceUid：`event:<eventId>:<actKey>:<positionKey>`，
+ * 同一事件的同一行为重放多少次都只落一行（幂等），且 raw_id 保持 0、永不被聊天回滚误伤。
+ *
+ * 判定口径与聊天完全一致：只拿事件自身的生图 prompt（character_events.prompt，即最后一幕的
+ * 英文 tag 串，逗号分隔）过确定性词表；拿不到 prompt 或没有任何成人 tag 就什么都不记，不猜测。
+ *
+ * @param {{characterId:number, eventId:number, prompt?:string, partnerKind?:string, occurredAt?:string}} params
+ * @returns {{inserted:number, skipped:number, blocked:boolean}}
+ */
+export function recordIntimateForEvent({
+  characterId,
+  eventId,
+  prompt = '',
+  partnerKind = 'user',
+  occurredAt,
+} = {}) {
+  const empty = { inserted: 0, skipped: 0, blocked: false };
+  // 总开关关闭 / 无有效 id：直接不记账（不回抛，调用方在奇遇收尾链路里）
+  if (config.features.intimate === false) return empty;
+  const charId = Number.parseInt(characterId, 10);
+  const evId = Number.parseInt(eventId, 10);
+  if (!Number.isSafeInteger(charId) || charId <= 0) return empty;
+  if (!Number.isSafeInteger(evId) || evId <= 0) return empty;
+
+  const tags = tagsFromPromptString(prompt);
+  if (tags.length === 0) return empty;
+  const classified = classifyPromptTags(tags);
+  if (classified.length === 0) return empty;
+
+  return recordIntimateActs(charId, {
+    scene: 'event',
+    // 与聊天链路保持一致：奇遇由用户的选择推进，默认记在 user 口径下（面板 viewScope 默认只看 user）
+    partnerKind,
+    rawId: 0,
+    source: 'auto',
+    occurredAt,
+    acts: classified.map(act => ({
+      ...act,
+      sourceUid: `event:${evId}:${act.actKey}:${act.positionKey}`,
+    })),
+  });
 }
 
 /**
@@ -1184,7 +1427,24 @@ ${taskPrompt}`
   // 4. 删除活跃事件
   db.prepare(`DELETE FROM character_events WHERE id = ?`).run(event.id);
 
-  // 5. SSE 广播
+  // 5. 亲密看板：奇遇场景记账（零 LLM，只用内存里这份 event.prompt 做确定性词表归类）
+  //    放在事件行删除之后、广播之前：event 对象已经拿全，不再额外查库；
+  //    失败只告警——看板统计绝不能影响奇遇收尾。幂等靠显式 sourceUid（见 recordIntimateForEvent）。
+  try {
+    const intimate = recordIntimateForEvent({
+      characterId: character.id,
+      eventId: event.id,
+      prompt: event.prompt,
+      partnerKind: 'user',
+    });
+    if (intimate.inserted > 0) {
+      console.log(`[eventGen] intimate recorded for event ${event.id}: +${intimate.inserted}`);
+    }
+  } catch (err) {
+    console.warn('[intimate] event record failed:', err.message);
+  }
+
+  // 6. SSE 广播
   broadcastEventConclusion({
     character_id: character.id,
     character_name: character.display_name,
@@ -1208,9 +1468,39 @@ function toSQLite(iso) {
   return iso.replace('T', ' ').replace(/\.\d+Z$/, '').replace(/Z$/, '');
 }
 
-// 修复 LLM 输出的非法 JSON 转义（image_prompt 规则中的 \( \) 等不是合法 JSON 转义）
+/**
+ * 修复 LLM 输出的非法 JSON 转义（image_prompt 规则中的 \( \) 等不是合法 JSON 转义）。
+ *
+ * ⚠️ 2026-10-04 修两个真 bug（报纸日报因此整个生成失败，见 `logs/backend-2026-10-04.log`
+ * 的 `[newspaper] LLM generation failed: Bad escaped character in JSON at position 1711`）：
+ *
+ *   ① **`\\` 被拆坏**（原实现 `/\\([^"\\\/bfnrtu])/g` 的盲点）：
+ *      `\\` 本身是**合法**转义，但原正则从"第二个反斜杠"起匹配，把 `C:\\path`（合法）
+ *      削成了 `C:\path`（**非法**）—— 修复器反而制造了它要修的那个错误。
+ *      实测：`{"a":"C:\\\\path"}` 本来 `JSON.parse` 得过，过一遍 repairJson 就抛
+ *      `Bad escaped character`。所以 `\\` 必须**整体跳过**。
+ *
+ *   ② **坏 `\u` 整条漏掉**：`\u` 只有在后面跟满 4 位十六进制时才合法，
+ *      而 `u` 在白名单里 ⇒ 原正则对 `\u你` 不匹配、原样放行 ⇒ 仍抛
+ *      `Bad Unicode escape`。现在按"去掉反斜杠、留 u"处理（与 `\(` → `(` 同一口径）。
+ *
+ * 顺带补了**结尾孤立反斜杠**（`"abc\` 这种截断输出）—— 原正则要求后面有字符，同样漏。
+ *
+ * 保序要点：合法 `\uXXXX` 与 `\\` 的**分支必须排在**宽泛的"坏转义"分支之前，
+ * 否则会被后者吃掉。改动这里之前，先跑 `test/repairJson.test.js` 的那张对照表。
+ */
 export function repairJson(text) {
-  return text.replace(/\\([^"\\\/bfnrtu])/g, '$1');
+  const src = String(text ?? '');
+  return src.replace(
+    /(\\u[0-9a-fA-F]{4})|(\\\\)|\\([^"\\\/bfnrtu])|(\\u)|(\\$)/g,
+    (match, goodUnicode, escapedPair, badEscape, badUnicode) => {
+      if (goodUnicode) return goodUnicode;   // 合法 \uXXXX：原样
+      if (escapedPair) return escapedPair;   // 合法 \\：原样（①的修复）
+      if (badEscape) return badEscape;       // \( \) \x …：去掉反斜杠
+      if (badUnicode) return 'u';            // \u 后不是 4 位 hex（②的修复）
+      return '';                             // 结尾孤立反斜杠（截断输出）
+    },
+  );
 }
 
 // 结局第三人称守卫：剥掉台词引号后仍残留第一人称称谓即视为跑偏（「自我」「忘我」等词不算）
@@ -1223,21 +1513,13 @@ function conclusionHasFirstPerson(text) {
 }
 
 // 从 LLM 原始输出中提取第一个完整 JSON 对象（括号计数，防 LLM 输出多段 JSON 拼在一起）
-export function extractFirstJson(text) {
-  const start = text.indexOf('{');
-  if (start === -1) return null;
-  let depth = 0, inString = false, escaped = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (escaped) { escaped = false; continue; }
-    if (ch === '\\') { escaped = true; continue; }
-    if (ch === '"') { inString = !inString; continue; }
-    if (inString) continue;
-    if (ch === '{') depth++;
-    else if (ch === '}') { depth--; if (depth === 0) return text.slice(start, i + 1); }
-  }
-  return null; // 括号未闭合
-}
+/**
+ * 从任意文本里取出第一个完整 JSON 对象。
+ * 2026-10-01：实现搬到 `jsonExtract.js`（那边有自己的说明：本模块会连带拉起生图栈，
+ * 而情绪评估等只想解析 JSON 的调用方不该被拖上整条生图依赖），这里**原样再导出**，
+ * 13 处既有 `import { extractFirstJson } from './eventGenerator.js'` 不用改。
+ */
+export { extractFirstJson } from './jsonExtract.js';
 
 function toISO(dt) {
   if (!dt) return dt;

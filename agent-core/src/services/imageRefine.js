@@ -27,7 +27,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { submitWorkflow, uploadImage, apiToGui } from './comfyClient.js';
 import sharp from 'sharp';
-import { config } from '../config.js';
+import { config, normalizeHiresQuality } from '../config.js';
 import {
   HIRES_WORKFLOW, HIRES_ADVANCED_WORKFLOW, ACTIVE_WORKFLOW, PRO_WORKFLOW, autoRestoreMissing,
 } from './workflowTemplates.js';
@@ -37,6 +37,29 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKFLOW_DIR = path.join(__dirname, '..', '..', '..', 'workflow');
 
 const PROMPT_PLACEHOLDER = '请输入画面描述';
+
+/** HiresFix 细化精度三档 → 步数（D1 实测：high 12 / medium 10 / low 8；CFG 恒 1.0） */
+export const HIRES_QUALITY_STEPS = { high: 12, medium: 10, low: 8 };
+
+/** `config.comfyui.hiresTurboSteps` 的内置默认值（config.js 写死 12）；变成别的值 = 用户显式覆盖 */
+const DEFAULT_TURBO_STEPS = 12;
+
+/**
+ * 决定这次 HiresFix 细化的步数。优先级（高 → 低）：
+ *
+ *   1. **`config.comfyui.hiresTurboSteps` 被显式改成非内置默认（12）的值** ⇒ 完全以它为准（底层逃生门，
+ *      给将来想手调的人留的；这样 `hiresQuality` 与它不会两处打架）；
+ *   2. `config.features.hiresQuality` 三档 ⇒ high 12 / medium 10 / **low 8（默认）**；非法值回落 low。
+ *
+ * CFG 不走这里：turbo 恒 1.0（`hiresTurboCfg`）；turbo 开关关掉时整体回到 `hiresSteps`/`hiresCfg`（旧口径）。
+ * @returns {number} 步数（1~100 之外不合法值已被上游 clamp，这里只保证是正整数）
+ */
+export function resolveTurboSteps() {
+  const override = Number(config.comfyui.hiresTurboSteps);
+  if (Number.isFinite(override) && override > 0 && override !== DEFAULT_TURBO_STEPS) return override;
+  const quality = normalizeHiresQuality(config.features?.hiresQuality);
+  return HIRES_QUALITY_STEPS[quality] ?? HIRES_QUALITY_STEPS.low;
+}
 
 function hiresPath() { return path.join(WORKFLOW_DIR, config.comfyui.hiresWorkflowMode === 'advanced' ? HIRES_ADVANCED_WORKFLOW : HIRES_WORKFLOW); }
 
@@ -194,11 +217,22 @@ export function buildHiresWorkflow(promptText, overrides = {}) {
       if (node.widgets_values[1] === 'randomize') {
         node.widgets_values[0] = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
       }
-      node.widgets_values[2] = config.comfyui.hiresSteps ?? 35;
-      node.widgets_values[3] = config.comfyui.hiresCfg ?? 5.0;
+      // 细化参数（2026-09-29 起带开关；2026-10-01 并入上游进阶版）：
+      // 「放大细化工作流.json」的主模型是 anima_turboV10，旧口径固定注入 CFG 5.0 / 35 步 ——
+      // CFG>1 会让 turbo 每步多跑一条无条件分支（双倍算力），蒸馏模型在 CFG>1 下画面也会退化。
+      const hiresTurbo = config.comfyui.hiresTurbo !== false;
+      node.widgets_values[2] = hiresTurbo ? resolveTurboSteps() : (config.comfyui.hiresSteps ?? 35);
+      node.widgets_values[3] = hiresTurbo ? (config.comfyui.hiresTurboCfg ?? 1.0) : (config.comfyui.hiresCfg ?? 5.0);
       node.widgets_values[6] = config.comfyui.hiresDenoise ?? 0.2;
       if (followSource) {
-        node.widgets_values.splice(2, 4, ...sourceSampling.slice(2, 6));
+        // 进阶版「采样跟随原图」：turbo 开关打开时只跟随采样器/调度器（step 2、3 已由 turbo 决定，
+        // 否则 UI 上「设置里的步数与 CFG 不生效」就成了假话）；关掉开关时整段跟随（上游原语义）。
+        if (hiresTurbo) {
+          node.widgets_values[4] = sourceSampling[4];
+          node.widgets_values[5] = sourceSampling[5];
+        } else {
+          node.widgets_values.splice(2, 4, ...sourceSampling.slice(2, 6));
+        }
       }
       continue;
     }

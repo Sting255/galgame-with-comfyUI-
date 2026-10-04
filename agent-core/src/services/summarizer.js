@@ -45,7 +45,7 @@ export function trimUnrepliedUserMessages(messages) {
   return list.slice(0, end);
 }
 
-const SUMMARIZE_INTERVAL = 10; // 每 10 条 assistant 消息触发一次
+export const SUMMARIZE_INTERVAL = 10; // 每 10 条 assistant 消息触发一次
 
 // 顺序即缓存：<chat_log> 排在任务与变量之前（见 buildSummaryMessages），这里只留后置部分
 const SUMMARY_TASK_PROMPT = `【上一段摘要】（更早的对话，已压缩过，不要重复它已经写明的信息）

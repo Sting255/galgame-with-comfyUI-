@@ -20,6 +20,10 @@ import { getDb, getSystemRulesWithWorld, getGlobalRule } from '../db/index.js';
 import { appendOathRing } from './oathUtils.js';
 import { buildCharacterPersona } from './characterPersona.js';
 import { chatSync } from '../llm/llm-client.js';
+// JSON 容错解析统一口径（括号配对扫描，全仓 13 个模块共用；2026-10-01 起情绪评估也走它）。
+// 注意 import 的是 `jsonExtract.js` 而不是 `eventGenerator.js`：后者会连带拉起生图栈
+// （imageSkill → comfyClient，import 时就去打 ComfyUI /object_info），情绪评估不需要那套依赖。
+import { extractFirstJson } from './jsonExtract.js';
 
 // ── 常量 ──
 
@@ -537,16 +541,39 @@ ${characterName}: "${cleanAssistant.slice(0, 500)}"
 
   const prompt = staticSystem + '\n' + variableData;
 
+  // ⚠️ `raw` 必须在 try **外面**声明：catch 里要用它做失败取证（头尾原文）。
+  //    第一版写在 try 里（`let raw = await chatSync(...)`）⇒ catch 引用到的是块作用域外，
+  //    抛 `raw is not defined` ⇒ **取证日志本身成了 error 日志**，等于白加（真机日志里抓到过）。
+  let raw = '';
   try {
-    let raw = await chatSync(
+    raw = await chatSync(
       [{ role: 'user', content: prompt }],
-      { temperature: 0.5, max_tokens: 200, response_format: { type: 'json_object' }, label: '情绪判断' }
+      // max_tokens 必须留够"思考 + JSON"：本项目的网关模型是思考型（supports_reasoning=true，
+      // reasoning 默认 high），原来只给 200 会被思考吃光 → content 为空/半截 →
+      // JSON.parse 抛 'Unexpected end of JSON input' → 评估永远零 delta（真机踩到过）。
+      { temperature: 0.5, max_tokens: 1500, response_format: { type: 'json_object' }, label: '情绪判断' }
     );
+    // chatSync 正常返回字符串，但也容忍 { content } 形态
+    raw = typeof raw === 'string' ? raw : String(raw?.content ?? '');
     raw = raw.trim();
     if (raw.startsWith('```')) {
       raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
     }
-    const parsed = JSON.parse(raw);
+    if (!raw) throw new Error('模型返回为空（可能是输出预算被思考吃光）');
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      // 容错（2026-10-01 修）：模型常见"**合法 JSON + 尾部多余字符**"（真机日志逐字：
+      // `Unexpected non-whitespace character after JSON at position 169`）。
+      // 旧写法取"第一个 { 到**最后**一个 }" ⇒ 把尾垃圾一起切进去、二次解析照样失败 ⇒
+      // 落到外层 catch **静默返回零 delta**，那一轮好感度/情绪白丢。
+      // 改用全仓共用的括号配对扫描器（`eventGenerator.extractFirstJson`，13 个模块同一口径）：
+      // 它在**第一个配平**处收手，尾部垃圾自然被丢掉。
+      const extracted = extractFirstJson(raw);
+      if (!extracted) throw new Error(`不是合法 JSON（前 120 字：${raw.slice(0, 120)}）`);
+      parsed = JSON.parse(extracted);
+    }
     return {
       delta: {
         valence:  clamp(parsed.vad_delta?.valence || 0, -MAX_INSTANT_SHIFT, MAX_INSTANT_SHIFT),
@@ -559,7 +586,14 @@ ${characterName}: "${cleanAssistant.slice(0, 500)}"
       source: 'llm',
     };
   } catch (err) {
-    console.error('[emotionEngine] LLM evaluate failed:', err.message);
+    // 失败要能被追查：旧日志只有 `err.message`（"…at position 169"），
+    // 看不到模型到底吐了什么 ⇒ 第八轮做日志取证时无从下手。补上原始输出的头尾。
+    console.error(
+      `[emotionEngine] LLM evaluate failed: ${err.message}` +
+      ` | raw 长度=${String(raw || '').length}` +
+      ` | 头 160=${JSON.stringify(String(raw || '').slice(0, 160))}` +
+      ` | 尾 80=${JSON.stringify(String(raw || '').slice(-80))}`
+    );
     return {
       delta: { valence: 0, arousal: 0, dominance: 0 },
       dominantEmotion: 'neutral',
@@ -948,7 +982,7 @@ ${imageRulesText}
 注意：这是对于收到礼物之后的反应的配图。
 
 只返回 JSON（不要其他文字）：
-{"text":"你的中文回应","imagePrompt":"英文生图描述"}`;
+{"text":"（你的中文回应，一句话，贴合她收到这件礼物后的真实反应）","imagePrompt":"（按上面的规范自己写一整段连贯英文画面描述：她在哪里、手上/身上有什么、表情动作、光线氛围。严禁中文，严禁把这些说明文字或规范原文抄进来。示例：a girl sitting on the bed holding a small gift box in both hands, looking down at it with a soft surprised smile, warm bedside lamp light on her face, conveying a quiet happy mood）"}`;
 
   let reaction, imagePrompt;
   try {
@@ -992,67 +1026,20 @@ ${imageRulesText}
   };
 }
 
-/**
- * 裁剪角色人格文本，仅保留关键信息用于情绪判断
- *
- * 规则（按固定格式）：
- *   1. 从开头取到 "## 你的身份" 之前
- *   2. 从 "## 你的性格" 取到第二个换行符（即第一条性格描述）
- *   3. 拼接后 "你" → characterName（默认 "assistant" 向后兼容）
- *
- * @param {string} basePrompt - 角色完整人格 prompt
- * @param {string} [characterName='assistant'] - 角色真实名称，用于替换 "你"
- *
- * 输入示例 → 输出示例:
- *   ("你是瓦雷莎...", "瓦雷莎")
- *   → "瓦雷莎是瓦雷莎...## 瓦雷莎的性格\n- 瓦雷莎说话总是慢悠悠的..."
- */
-export function cropPersonalityForEmotion(basePrompt, characterName = 'assistant') {
-  if (!basePrompt) return '';
+// ── 人格裁剪：已抽到零依赖的叶子模块 `personalityCrop.js`（2026-10-02）──
+// 为什么搬：`characterPersona.js` 的 short 变体要"运行时现裁"，而本文件**反过来** import 了
+// characterPersona（见文件顶部）⇒ 若让 characterPersona 直接 import 本文件就成环，还会把 db / llm
+// 整条依赖链拖进那个被 58 处引用的模块。裁剪逻辑本身不依赖任何模块，所以它适合当叶子。
+//
+// ⚠️ 这里必须**同时**写 import 与 export … from 两条语句：
+//    · `export { x } from './x.js'` **不产生本地绑定** —— 而本文件内部仍要调用
+//      `cropPersonalityForEmotion`（`characters.js` 的 short_prompt 迁移链会走到这里），
+//      只再导出会让它变成 `ReferenceError: cropPersonalityForEmotion is not defined`（本仓真机出过同类 bug）；
+//    · 因此：import 供本文件使用，export … from 供外部（characters.js / momentCommentService.js /
+//      momentInteractionService.js / personalityCrop.test.js）继续按原路径拿到同样的函数。
+import { cropPersonalityForEmotion, getPersonalityCropMaxChars } from './personalityCrop.js';
 
-  let result = '';
-
-  // 规则 1: 从头开始，到 "## 你的身份" 停止（不含该标题）
-  const identityIdx = basePrompt.indexOf('## 你的身份');
-  if (identityIdx !== -1) {
-    result += basePrompt.slice(0, identityIdx).trimEnd();
-  } else {
-    result += basePrompt.trimEnd();
-  }
-
-  // 规则 2: 从 "## 你的性格" 开始，遇到第二个换行符结束
-  const personalityIdx = basePrompt.indexOf('## 你的性格');
-  if (personalityIdx !== -1) {
-    const fromPersonality = basePrompt.slice(personalityIdx);
-    let newlineCount = 0;
-    let endIdx = 0;
-    for (let i = 0; i < fromPersonality.length; i++) {
-      if (fromPersonality[i] === '\n') {
-        newlineCount++;
-        if (newlineCount === 2) {
-          endIdx = i;
-          break;
-        }
-      }
-    }
-    if (endIdx > 0) {
-      result += fromPersonality.slice(0, endIdx);
-    } else {
-      // 没有第二个换行符（异常格式），整段保留
-      result += fromPersonality;
-    }
-  }
-
-  // 规则 3: "你" 全部替换为角色名
-  result = result.replace(/你/g, characterName);
-
-  // 兜底：最长不超过 200 字
-  if (result.length > 200) {
-    result = result.slice(0, 200);
-  }
-
-  return result;
-}
+export { cropPersonalityForEmotion, getPersonalityCropMaxChars } from './personalityCrop.js';
 
 // ── Short Prompt LLM 浓缩 + 启动迁移 ──
 

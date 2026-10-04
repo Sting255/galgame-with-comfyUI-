@@ -108,6 +108,7 @@
       :open="drawerOpen"
       :char="detailChar"
       :activities="detailActs"
+      :private-moment="detailPrivateMoment"
       :loading="detailLoading"
       :peek-busy="peekBusy"
       :regenerating="detailRegenerating"
@@ -497,6 +498,8 @@ const detailChar = computed(() => {
   return enrichedChars.value.find(x => x.id === selectedCharId.value) || null
 })
 const detailActs = ref<any[]>([])
+/** 她今天的私密时刻（2026-10-02 自慰玩法）：随日程响应一起回来，抽屉里给一条提示 */
+const detailPrivateMoment = ref<any>(null)
 const detailLoading = ref(false)
 const detailRegenerating = ref(false)
 
@@ -801,7 +804,11 @@ async function onSelectChar(id: number) {
   detailActs.value = []
   try {
     const d = await store.fetchCharacterSchedule(id)
-    if (current()) detailActs.value = d.activities || []
+    if (current()) {
+      detailActs.value = d.activities || []
+      // 私密时刻（2026-10-02）：同一份日程响应里就带着，不用多发一次请求
+      detailPrivateMoment.value = d.private_moment || null
+    }
   } catch { if (current()) detailActs.value = [] }
   finally { if (current()) detailLoading.value = false }
 }

@@ -1,10 +1,28 @@
 import { Router } from 'express';
 import { getDb } from '../db/index.js';
-import { listExpressionStandings, startStandingBatch, controlStandingBatch, updateStandingPrompt, editStandingImage, deleteStanding } from '../services/expressionStandingService.js';
+import { listExpressionStandings, listStandingOverview, startAllStandingBatches, startStandingBatch, controlStandingBatch, updateStandingPrompt, editStandingImage, deleteStanding } from '../services/expressionStandingService.js';
 import { getStandingDisplay } from '../services/standingDisplay.js';
+import { createStandingInteractionService } from '../services/standingInteractionService.js';
+import { imageUrlExists } from '../services/imagePaths.js';
+import { broadcast } from '../services/unifiedStreamBus.js';
+import { readTouchLines, saveTouchLines, fillMissingTouchLines } from '../services/standingTouchLines.js';
+import { regenerateStandingTouchLines, generateStandingTouchLines } from '../services/expressionStandingService.js';
 
 const router = Router();
+router.get('/expression-standings/overview', (_req, res) => res.json({ characters: listStandingOverview() }));
+router.post('/expression-standings/generate', (req, res) => res.status(202).json(startAllStandingBatches(req.body)));
+router.post('/expression-standings/touch-lines/fill', (_req,res)=>res.status(202).json(fillMissingTouchLines({db:getDb(),generate:generateStandingTouchLines,emit:broadcast})));
 const base = '/characters/:id/expression-standings';
+const interactions = () => createStandingInteractionService({ db: getDb(), imageExists: imageUrlExists, emit: broadcast });
+router.get(`${base}/touch-lines`, (req,res)=>{
+  if(!getDb().prepare('SELECT id FROM characters WHERE id=?').get(req.params.id))return res.status(404).json({error:'角色不存在'});
+  res.json(readTouchLines(getDb(),req.params.id));
+});
+router.put(`${base}/touch-lines`, (req,res)=>res.json(saveTouchLines({db:getDb(),id:Number(req.params.id),lines:req.body.lines,expectedVersion:req.body.expectedVersion,emit:broadcast})));
+router.post(`${base}/touch-lines/generate`, (req,res)=>res.status(202).json(regenerateStandingTouchLines(req.params.id,req.body.expectedVersion)));
+router.get('/characters/:id/standing-interaction', (req, res) => res.json(interactions().get(req.params.id)));
+router.put('/characters/:id/standing-interaction', (req, res) => res.json(interactions().save(req.params.id, req.body)));
+router.put(`${base}/:slot/interaction-regions`, (req, res) => res.json(interactions().saveRegions(req.params.id, req.params.slot, req.body)));
 router.get(base, (req, res) => res.json(listExpressionStandings(req.params.id)));
 router.post(`${base}/generate`, (req, res) => res.status(202).json(startStandingBatch(req.params.id, req.body)));
 router.post(`${base}/jobs/:jobId/:action`, (req, res) => res.json(controlStandingBatch(req.params.id, req.params.jobId, req.params.action)));

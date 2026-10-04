@@ -130,6 +130,30 @@ export function getCheckpointHistory(db, conversationId, maxMessages = MAX_UNCOM
 }
 
 /**
+ * 某个 raw id 是否落在任一屏蔽区间内（闭区间，容忍传入反向的端点）。
+ *
+ * 只认"区间"，不认识"催眠 / 遗忘"这类业务语义——区间由调用方负责给出（chat.js 从
+ * hypnosisService.listForgottenWindows 取），组装器保持通用。
+ *
+ * @param {number} rawId
+ * @param {Array<{fromRawId:number,toRawId:number}>} windows
+ * @returns {boolean}
+ */
+function isRawInWindows(rawId, windows) {
+  const id = Number(rawId);
+  if (!Number.isSafeInteger(id) || id <= 0) return false;
+  for (const window of windows) {
+    const from = Number(window?.fromRawId);
+    const to = Number(window?.toRawId);
+    if (!Number.isFinite(from) || !Number.isFinite(to)) continue;
+    const lo = Math.min(from, to);
+    const hi = Math.max(from, to);
+    if (id >= lo && id <= hi) return true;
+  }
+  return false;
+}
+
+/**
  * 获取二分历史：按分界线拆分为 checkpoint 历史 + 活跃聊天历史（滑动窗口）。
  *
  * checkpoint 边界由 rolling_summaries.end_msg_id 决定：
@@ -143,9 +167,13 @@ export function getCheckpointHistory(db, conversationId, maxMessages = MAX_UNCOM
  * @param {string} conversationId
  * @param {number} [maxActiveRounds=10]  活跃聊天历史最多保留轮数
  * @param {number} [maxCheckpointRounds=10] checkpoint 历史保留 assistant 条数
+ * @param {{userName?: string, characterName?: string, excludeWindows?: Array<{fromRawId:number,toRawId:number}>}} [options]
+ *        `excludeWindows`：要屏蔽的 raw 区间（如催眠遗忘窗口）。命中的 raw **不进模型上下文**；
+ *        原始聊天记录仍保留在库里（可审计、可撤销），前端展示的历史也不受影响——
+ *        这里屏蔽的只是"喂给模型的这一段历史"。不传时行为与改动前逐字节一致。
  * @returns {{ checkpoint, checkpointHistory, checkpointRounds, activeText, activeRounds }}
  */
-export function getSplitHistory(db, conversationId, maxActiveRounds = 10, maxCheckpointRounds = 10, { userName = 'user', characterName = 'assistant' } = {}) {
+export function getSplitHistory(db, conversationId, maxActiveRounds = 10, maxCheckpointRounds = 10, { userName = 'user', characterName = 'assistant', excludeWindows = [] } = {}) {
   // 1. 找到最新摘要分界线（冻结点）
   const checkpoint = db.prepare(`
     SELECT id, end_msg_id, summary
@@ -159,13 +187,24 @@ export function getSplitHistory(db, conversationId, maxActiveRounds = 10, maxChe
   // ── 2. 活跃窗口：未摘要消息 (id > afterId)，按时间顺序，最多显示 maxActiveRounds 条 assistant ──
   const tailMsgs = [];
   const activeFetchLimit = maxActiveRounds * 3; // 覆盖 10 条 assistant + 穿插的 user
-  const activeRaw = db.prepare(`
+  const activeFetched = db.prepare(`
     SELECT id, role, content FROM (
       SELECT id, role, content FROM raw_messages
       WHERE conversation_id = ? AND id > ? AND role IN ('user', 'assistant')
       ORDER BY id DESC LIMIT ?
     ) ORDER BY id ASC
   `).all(conversationId, afterId, activeFetchLimit);
+
+  // 屏蔽区间（催眠遗忘窗口等）：在 SELECT 之后**立刻**过滤，后面"从尾部数 maxActiveRounds
+  // 条 assistant"的计数就天然只数留下来的消息，切片语义正确。
+  // 末尾那条未回复的 user 是**当前输入**，无论如何保留（它的 id 必在窗口右端之后，但这里显式例外更稳）。
+  // 说明：原聊天记录仍在库里（可审计、可撤销），前端展示的历史不变——屏蔽的只是喂给模型的这段。
+  // 不传 excludeWindows 时直接用原数组，零行为变化。
+  const activeRaw = excludeWindows.length > 0
+    ? activeFetched.filter((msg, index) => (
+      (index === activeFetched.length - 1 && msg.role === 'user') || !isRawInWindows(msg.id, excludeWindows)
+    ))
+    : activeFetched;
 
   // 剔除末尾未回复的 user 消息（当前输入），不计入活跃窗口
   const unrepliedUser = activeRaw.length > 0 && activeRaw[activeRaw.length - 1].role === 'user'
@@ -203,13 +242,19 @@ export function getSplitHistory(db, conversationId, maxActiveRounds = 10, maxChe
 
   if (afterId > 0) {
     const checkpointFetchLimit = maxCheckpointRounds * 3; // 覆盖 10 条 assistant
-    const checkpointRaw = db.prepare(`
+    const checkpointFetched = db.prepare(`
       SELECT id, role, content FROM (
         SELECT id, role, content FROM raw_messages
         WHERE conversation_id = ? AND id <= ? AND role IN ('user', 'assistant')
         ORDER BY id DESC LIMIT ?
       ) ORDER BY id ASC
     `).all(conversationId, afterId, checkpointFetchLimit);
+
+    // 与活跃侧同样按屏蔽区间过滤（checkpoint 侧没有"当前输入"要保留，直接滤）。
+    // 过滤后 checkpointRounds/asstCount 都基于留下的消息计算，口径一致。
+    const checkpointRaw = excludeWindows.length > 0
+      ? checkpointFetched.filter(msg => !isRawInWindows(msg.id, excludeWindows))
+      : checkpointFetched;
 
     // 从尾部向前数 10 条 assistant，截取对应消息段
     let asstCount = 0;

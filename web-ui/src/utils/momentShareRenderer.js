@@ -923,7 +923,6 @@ function renderCollage(ctx, m, u, W, H) {
       }
       drawTape(ctx)
       addHeroDecor(m, drawTape)
-      cursor = mainFrame.y + mainFrame.h + 48 * u
     }
     if (block) {
       drawTextBlock(ctx, block, contentX, textTop, C.ink)

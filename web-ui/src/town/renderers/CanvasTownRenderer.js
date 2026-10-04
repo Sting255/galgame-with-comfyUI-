@@ -231,7 +231,6 @@ function drawAgent(c, a, pos, nowMs, labelsOnly = false) {
       c.imageSmoothingQuality = 'high'
       c.drawImage(standing, px - w / 2, feetY - h, w, h)
       c.restore()
-      drew = true
     } else {
       const r = HW * 0.75
       const cy = feetY - r - bob
@@ -257,7 +256,6 @@ function drawAgent(c, a, pos, nowMs, labelsOnly = false) {
         c.fillText((a.displayName || '?').charAt(0), px, cy + 1)
       }
       c.restore()
-      drew = true
     }
   }
 

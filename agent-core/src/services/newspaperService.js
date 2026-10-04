@@ -6,7 +6,8 @@
  *     由 LLM 依据 <world_setting> 演算，每条配一幅插画
  *   - 15% 概率出现一条"世界状态"（影响全镇所有人，当天生效）；
  *     注入位置与道具 buff 相同（chat.js 稳定块[1]）
- *   - 绑定角色的特稿会在当天注入：该角色的私聊动态块、其所在群聊的轮次指令，
+ *   - 绑定角色的特稿会在当天注入：该角色的私聊动态块、其所在群聊的轮次指令（群聊侧限额
+ *     GROUP_INJECT_ROUNDS 轮，之后当天不再注入，避免特稿主角被反复提起），
  *     并驱动该角色当天额外发一条吐槽朋友圈（momentScheduler 消费 complaint_after）
  *
  * 纯函数（normalizeNewspaperDraft / build*Block / buildComplaintTopic 等）导出供测试。
@@ -18,7 +19,12 @@ import { generateImageRaw } from './imageSkill.js';
 import { recordCompletedImageTask } from './imageTaskRecorder.js';
 import { saveBase64Image } from './imagePaths.js';
 import { config } from '../config.js';
-import { getLocalDateKey } from '../utils/localDate.js';
+// 2026-10-01（用户："日报的板块如果日期更新了也要去更新日报"）：
+// 报纸的"今天"必须跟**程序时间**走，不能跟真实日期走。
+// 原来用 `getProgramDateKey()`（真实日期）⇒ 用户把时间推进一天，报纸还是真实日期那一期、
+// 新的一天没有报纸（`getTodayNewspaper()` 查不到 ⇒ 前端一直空着）。这里统一换成程序日期口径。
+// 注意：`publish_date` 存的仍是 `YYYY-MM-DD`，历史回看 `getNewspaperByDate` 不受影响。
+import { getProgramDateKey, getProgramNow } from './programTime.js';
 import { getLightNoteWithWeather } from './timeLight.js';
 import { extractFirstJson, repairJson } from './eventGenerator.js';
 import { buildCharacterPersona } from './characterPersona.js';
@@ -28,10 +34,18 @@ import { ITEM_EFFECTS, WORLD_OUTFIT_CHANCE } from './itemService.js';
 export const NEWSPAPER_NAME = '邻舍日报';
 export const NEWSPAPER_TAGLINE = '今日事 · 早知道';
 export const WORLD_STATE_PROBABILITY = 0.15;
+// 群聊注入限额：报纸块只在该群的前 4 轮群聊里注入，之后当天不再出现。
+// 天天每轮都提醒一次"今早的报纸写了谁"，特稿主角会被反复提起；限额让它只当开场谈资。
+export const GROUP_INJECT_ROUNDS = 4;
 // 每天零点起生成当天报纸：replyQueueScheduler 的第一个调度 tick 触发（内部自带去重/节流/错误兜底）
 // 注：日程已不注入报纸素材，无需再等清晨日程刷新；零点刷新让"昨天的预告"与"今天的事"严格对应
 export const GENERATION_HOUR = 0;
-const FAIL_RETRY_DELAY_MS = 15 * 60 * 1000; // LLM 失败后 15 分钟内不重试
+// 2026-10-02 修（真机日志：调时后现场看不到报纸，`[newspaper] Daily generation failed: Connection error`
+// 之后 20 分钟才补出来）：原来失败一律冷却 15 分钟 ⇒ 网关偶发抖一下，报纸就"消失"一刻钟。
+// 现在分两档：**第一次失败 20 秒后就重试**（网关抖一下基本能自愈），连续失败才退到 15 分钟，避免刷接口。
+const FAIL_RETRY_DELAY_MS = 15 * 60 * 1000;
+const FAIL_RETRY_FAST_MS = 20 * 1000;
+let consecutiveFails = 0;
 
 let generating = null;      // 当天生成任务的去重句柄
 let lastFailedAt = 0;
@@ -51,7 +65,7 @@ function safeParseJson(text) {
 
 export function getTodayNewspaper() {
   const db = getDb();
-  return db.prepare('SELECT * FROM town_newspapers WHERE publish_date = ?').get(getLocalDateKey()) || null;
+  return db.prepare('SELECT * FROM town_newspapers WHERE publish_date = ?').get(getProgramDateKey()) || null;
 }
 
 /** 报纸行 → 前端结构（绑定角色补充头像/名字；today 与历史回看共用） */
@@ -113,7 +127,7 @@ export function setWorldStateDismissed(dismissed) {
   const changed = db.prepare('UPDATE town_newspapers SET world_dismissed = ? WHERE id = ? AND world_dismissed != ?')
     .run(dismissed ? 1 : 0, row.id, dismissed ? 1 : 0).changes;
   if (changed > 0) {
-    console.log(`[newspaper] World state ${dismissed ? 'dismissed' : 'restored'} for ${getLocalDateKey()}`);
+    console.log(`[newspaper] World state ${dismissed ? 'dismissed' : 'restored'} for ${getProgramDateKey()}`);
   }
   return true;
 }
@@ -124,17 +138,25 @@ function dbCharacterBrief(characterId) {
 
 // ── 生成调度入口（replyQueueScheduler tick 调用；不阻塞 tick） ──
 
-export function maybeGenerateDailyNewspaper(now = new Date()) {
+export function maybeGenerateDailyNewspaper(now = getProgramNow()) {
   if (now.getHours() < GENERATION_HOUR) return null;
   const existing = getTodayNewspaper();
   // 当天报纸已出：只剩补图一条路（生成中途重启 / ComfyUI 当时没开 / 单张失败都靠这里兜底）
   if (existing) return maybeRefillTodayImages(existing);
-  if (Date.now() - lastFailedAt < FAIL_RETRY_DELAY_MS) return null;
+  // 失败冷却分两档：第一次失败 20 秒后就重试（网关抖一下能自愈），连续失败才退到 15 分钟
+  const cooldown = consecutiveFails <= 1 ? FAIL_RETRY_FAST_MS : FAIL_RETRY_DELAY_MS;
+  if (Date.now() - lastFailedAt < cooldown) return null;
   if (generating) return generating;
   generating = generateDailyNewspaper()
+    .then(() => { consecutiveFails = 0; return { ok: true }; })
     .catch(err => {
       lastFailedAt = Date.now();
-      console.error('[newspaper] Daily generation failed:', err.message);
+      consecutiveFails += 1;
+      console.error(`[newspaper] Daily generation failed: ${err.message}（第 ${consecutiveFails} 次，`
+        + `${Math.round((consecutiveFails <= 1 ? FAIL_RETRY_FAST_MS : FAIL_RETRY_DELAY_MS) / 1000)} 秒后重试）`);
+      // ⚠️ 不要再"吞掉错误就当成功"：调用方（比如整点翻页 job）要能看出这次没成，
+      //    否则日志里会出现 `[rollover] daily_newspaper ok` 这种假成功（真机就是这么误导人的）。
+      return { ok: false, error: err.message || String(err) };
     })
     .finally(() => { generating = null; });
   return generating;
@@ -177,18 +199,39 @@ export function pickFeaturedCharacter(db) {
   `).get() || null;
 }
 
+// 变身日概率（世界状态日内，变身 vs 服装 = 40% vs 60%）
+export const WORLD_TRANSFORM_CHANCE = 0.4;
+
 /**
- * 世界影响抽取：服装 / 变身五五开；服装内部与开箱 rollEffectKey 同口径——
+ * 变身日预设形态池：抽中变身日后从这里均匀锁定一种，全镇当天统一变成这同一种。
+ * 每种形态的 theme 写死器官组合（外观注入与立绘生成都以它为准），不再让 LLM 自由发挥——
+ * 自由发挥会让报纸写出「各家长了不同器官」的五花八门场面，与全镇统一临时外观的注入机制冲突。
+ */
+export const WORLD_TRANSFORM_FORMS = [
+  { name: '猫娘', theme: '猫娘化：头顶一对毛绒猫耳，身后一条细长的猫尾巴，瞳孔变成略扁的竖椭圆；除此之外不多出任何其他器官' },
+  { name: '龙娘', theme: '龙娘化：头顶一对小巧的龙角，身后一条覆着细鳞的龙尾巴；不长翅膀，除此之外不多出任何其他器官' },
+  { name: '狐娘', theme: '狐娘化：头顶一对尖尖的狐耳，身后一条蓬松的大狐狸尾巴；除此之外不多出任何其他器官' },
+  { name: '犬娘', theme: '犬娘化：头顶一对耷拉的狗耳朵，身后一条摇摆的狗尾巴；除此之外不多出任何其他器官' },
+  { name: '兔娘', theme: '兔娘化：头顶一对长长的竖立兔耳，身后一个绒球似的短兔尾；除此之外不多出任何其他器官' },
+  { name: '精灵耳', theme: '精灵化：只把耳朵变成一对向外伸展的细长精灵耳；不长尾巴、不长角，除此之外不多出任何其他器官' },
+  { name: '猪猪', theme: '猪猪化：鼻尖变成可爱的圆猪鼻子，头顶一对小猪耳朵，身后一条卷卷的小猪尾巴；除此之外不多出任何其他器官' },
+];
+
+/**
+ * 世界影响抽取：服装 / 变身四六开（变身 40%）；服装内部与开箱 rollEffectKey 同口径——
  * 40% 命中世界观服装（WORLD_OUTFIT_CHANCE，需世界观存在，否则回落固定款），
  * 其余在固定款里均匀抽。发型卡、功能道具不参与。
+ * 变身不再由 LLM 决定形态：从 WORLD_TRANSFORM_FORMS 预设池里均匀锁定一种，全镇统一。
  * @returns {{ key: string, kind: string, name: string, theme: string }}
  */
 export function pickWorldLoot(hasWorldSetting = false) {
   const all = Object.entries(ITEM_EFFECTS);
   const byKind = kind => all.filter(([, e]) => e.kind === kind);
-  const pool = Math.random() < 0.5
-    ? byKind('transform')
-    : (hasWorldSetting && Math.random() < WORLD_OUTFIT_CHANCE ? byKind('world_outfit') : byKind('outfit'));
+  if (Math.random() < WORLD_TRANSFORM_CHANCE) {
+    const form = WORLD_TRANSFORM_FORMS[Math.floor(Math.random() * WORLD_TRANSFORM_FORMS.length)];
+    return { key: 'transform', kind: 'transform', name: form.name, theme: form.theme };
+  }
+  const pool = hasWorldSetting && Math.random() < WORLD_OUTFIT_CHANCE ? byKind('world_outfit') : byKind('outfit');
   const [key, effect] = pool[Math.floor(Math.random() * pool.length)];
   return { key, kind: effect.kind, name: effect.name, theme: effect.theme };
 }
@@ -252,7 +295,7 @@ export async function generateDailyNewspaper() {
     INSERT INTO town_newspapers (publish_date, name, edition, items_json, character_id, character_event_json, world_state_json, moment_done, complaint_after)
     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
   `).run(
-    getLocalDateKey(),
+    getProgramDateKey(),
     NEWSPAPER_NAME,
     edition,
     JSON.stringify(draft.news),
@@ -262,7 +305,7 @@ export async function generateDailyNewspaper() {
     toSQLiteDate(complaintAfter),
   );
   const paperId = Number(insertResult.lastInsertRowid);
-  console.log(`[newspaper] 《${NEWSPAPER_NAME}》第${edition}期 published for ${getLocalDateKey()} (featured: ${featured.display_name}, worldState: ${draft.world_state ? draft.world_state.name : 'none'})`);
+  console.log(`[newspaper] 《${NEWSPAPER_NAME}》第${edition}期 published for ${getProgramDateKey()} (featured: ${featured.display_name}, worldState: ${draft.world_state ? draft.world_state.name : 'none'})`);
 
   // ── 配图：逐张生成（不阻塞文字上线，失败留空由前端占位 + tick 补印兜底）──
   await fillPaperImages(db.prepare('SELECT * FROM town_newspapers WHERE id = ?').get(paperId));
@@ -284,7 +327,15 @@ async function generateNewsImage(prompt, { ragQuery, loras, character } = {}) {
     priority: 'low',
     ...(loras?.length ? { customWorkflow: character?.custom_workflow || null, loras } : {}),
   });
-  if (!genResult?.success || !genResult.images?.length) return null;
+  if (!genResult?.success || !genResult.images?.length) {
+    // 2026-10-04 用户实测："日报的图加载不出来"，翻日志却**找不到任何原因** ——
+    // 就是这里在静默吞：`fillPaperImages` 拿到 null 直接 continue，一行都不打。
+    // 出图失败最典型的原因就是 ComfyUI 没启动（imageSkill 自己那条 `All ComfyUI submit
+    // attempts exhausted` 离报纸链太远，看不出是谁要的图）。这里补一条**带栏目**的明话。
+    console.warn('[newspaper] 出图失败（ComfyUI 没启动 / 连接失败 / 未返回图片）: '
+      + String(genResult?.error || genResult?.message || '无图返回'));
+    return null;
+  }
   const img = genResult.images[0];
   const url = saveBase64Image('newspaper', `np_${Date.now()}_${img.filename || 'comfy.png'}`, img.base64);
   return {
@@ -339,7 +390,13 @@ async function fillPaperImages(row) {
         character: task.hasLoras ? character : null,
       });
       const fresh = db.prepare('SELECT * FROM town_newspapers WHERE id = ?').get(row.id);
-      if (!result || !fresh) continue;
+      // 2026-10-04：原来这里是裸 `continue` —— 出图失败在日志里一个字都不留，
+      // 用户拿日志排查只能看到"报纸没图"，原因（ComfyUI 没开）却查无此处。
+      if (!result) {
+        console.warn(`[newspaper] 配图未生成（${task.key}）：本轮跳过，下个 tick 会重试`);
+        continue;
+      }
+      if (!fresh) continue;
       recordCompletedImageTask({
         conversationId: 'town_newspaper',
         promptOriginal: task.image,
@@ -440,20 +497,46 @@ export function getCharacterEventBlockFor(characterId) {
   return buildCharacterEventBlock(null, safeParseJson(row.character_event_json));
 }
 
-/** groupChatEngine.js 注入口：该群的报纸块。主角不在群里 → 整块不注入：
- *  群成员对着"特稿里陌生人的事"聊天只会出戏；世界状态不受此影响——
- *  它仍经私聊 chat.js 稳定块作用于每个角色（那是全镇效果，与群成员构成无关） */
-export function getGroupNewspaperBlockFor(group) {
+/**
+ * 记账：本轮该群还能不能携带报纸块。能则把「该群对本期报纸已用轮数」+1 并落库，返回 true。
+ * 换期（paper_id 不同，即次日新报纸）自动从 0 重算；群行不存在（已删群 / 裸对象）按不发放处理。
+ */
+function consumeGroupNewspaperRound(groupId, paperId) {
+  const db = getDb();
+  const row = db.prepare('SELECT newspaper_paper_id, newspaper_rounds_used FROM group_chats WHERE id = ?').get(groupId);
+  if (!row) return false;
+  const samePaper = Number(row.newspaper_paper_id) === Number(paperId);
+  const used = samePaper ? (row.newspaper_rounds_used || 0) : 0;
+  if (used >= GROUP_INJECT_ROUNDS) return false;
+  db.prepare('UPDATE group_chats SET newspaper_paper_id = ?, newspaper_rounds_used = ? WHERE id = ?')
+    .run(paperId, used + 1, groupId);
+  console.log(`[newspaper] group ${groupId} got the newspaper block (round ${used + 1}/${GROUP_INJECT_ROUNDS} of paper ${paperId})`);
+  return true;
+}
+
+/** groupChatEngine.js 注入口：该群的报纸块（限额发放，用满 GROUP_INJECT_ROUNDS 轮后当天不再注入）。
+ *
+ *  限额：报纸块只在该群的前 GROUP_INJECT_ROUNDS 轮群聊里出现（user/idle/lull/opening 都算一轮），
+ *  第 5 轮起当天不再注入——否则每轮都在提醒模型"今早报纸写了谁"，特稿主角会被反复提起。
+ *  轮数按 (群, 报纸) 持久化在 group_chats.newspaper_paper_id / newspaper_rounds_used：
+ *  次日新一期自动从 0 重新计，进程重启也不会重新发放；
+ *  本轮没真正产出内容（buildGroupNewspaperBlock 返回空）不消耗轮数。
+ *
+ *  主角不在群里 → 整块不注入（同样不消耗轮数）：群成员对着"特稿里陌生人的事"聊天只会出戏；
+ *  世界状态不受此影响——它仍经私聊 chat.js 稳定块作用于每个角色（那是全镇效果，与群成员构成无关）。 */
+export function takeGroupNewspaperBlockFor(group) {
   const row = getTodayNewspaper();
-  if (!row?.character_id) return '';
-  const memberIds = (group?.members || []).map(m => String(m.id));
-  const featured = group.members.find(m => String(m.id) === String(row.character_id));
+  if (!row?.character_id || !group?.id) return '';
+  const featured = (group.members || []).find(m => String(m.id) === String(row.character_id));
   if (!featured) return '';
-  return buildGroupNewspaperBlock({
+  const block = buildGroupNewspaperBlock({
     worldState: row.world_dismissed ? null : safeParseJson(row.world_state_json),
     characterEvent: safeParseJson(row.character_event_json),
     featuredMemberName: featured.display_name || null,
   });
+  if (!block) return '';
+  if (!consumeGroupNewspaperRound(group.id, row.id)) return '';
+  return block;
 }
 
 // ── 朋友圈吐槽帖（momentScheduler 消费） ──
@@ -464,7 +547,7 @@ export function getPendingComplaint() {
     SELECT * FROM town_newspapers
     WHERE publish_date = ? AND character_id IS NOT NULL AND moment_done = 0
       AND complaint_after IS NOT NULL AND complaint_after <= datetime('now')
-  `).get(getLocalDateKey());
+  `).get(getProgramDateKey());
   if (!row) return null;
   const character = db.prepare('SELECT * FROM characters WHERE id = ?').get(row.character_id);
   if (!character) return null;
@@ -495,7 +578,7 @@ export function buildFormatPrompt(withWorldState, featuredName = '今日主角',
   const worldStateExample = withWorldState ? `,
   "world_state": {
     "name": "状态名（2~6字，要让读者一眼看出今天全镇与素材里给到的「${worldLoot?.name || '今日异变'}」有关，如「全镇换装日」这种叫法，不要照抄示例）",
-    "description": "第三人称说明（120~200字：这种状态今天如何笼罩小镇、居民会经历什么、到明天自然消退。全镇居民都受到素材指定的效果影响，要写出大家换上/变身后的具体样子与生活变化）",
+    "description": "第三人称说明（120~200字：这种状态今天如何笼罩小镇、居民会经历什么、到明天自然消退。全镇居民都受到素材指定的同一种效果影响——换上的是同一套服装/变成的是同一种形态，要写出大家换上/变身后的具体样子与生活变化）",
     "outfit": "第三人称全镇统一外观描述（60~120字：只写外观不写剧情，按素材【今日镇内异变】的效果主题取材，写清居民们换上的服装款式/变身后的形态细节——配色、材质、标志性元素等；这段文字会被作为今天的临时外观注入每个角色的外观段与立绘生成，全镇统一同一种）",
     "news": "报纸对它的报道（120~240字，可带一点「号外」式的打趣口吻，报道全镇居民受这个效果影响的众生相）",
     "effect_prompt": "第二人称状态指令（120~240字：直接告诉每个角色「今天你身上发生了什么变化、言行会有哪些具体表现」；必须紧扣素材指定的效果——今天全镇居民都换上了这套服装/变成了这种形态，把外观细节写具体；这段文字会被逐字注入每个角色的提示词，必须可直接执行，不要写成新闻报道腔）",
@@ -515,7 +598,7 @@ export function buildFormatPrompt(withWorldState, featuredName = '今日主角',
       "category": "栏目名（2~4字，从这些方向里选贴合的：市集/民生/邻里/天气/公告/奇闻/闲谈）",
       "title": "新闻标题（≤12字，报纸标题口吻，预告今天的事，如「市集今起增设夜摊」）",
       "content": "新闻正文（120~240字。报纸简讯口吻：第三人称，写清谁/在哪/今天会发生什么，把来龙去脉、现场细节和镇民反应展开写，像小镇周报里的完整报道而不是一句话豆腐块，不要抒情总结）",
-      "image_prompt": "英文新闻插画描述（一段完整英文：写清画面主体、动作、地点、光线，报纸编辑插画风格；画面中不出现任何文字、边框或水印）"
+      "image_prompt": "英文新闻插画描述（一段完整英文：写清画面主体、动作、地点、光线，报纸编辑插画风格；画面中不出现任何文字、边框或水印。画面主体**只能取自这个世界本身的居民**——用「a female student」「a shopkeeper」这类泛称，**禁止出现任何现实作品/游戏/动画的版权角色名**；必须画出具体的人、动作与场所，不要画成物件特写、产品图或没有人的静物；画面里的穿着与行为必须**与<world_setting>一致**）"
     }
   ],
   "character_event": {
@@ -564,12 +647,12 @@ export function buildMaterialsPrompt(featured, withWorldState, worldLoot = null)
   const persona = buildCharacterPersona(featured, { variant: 'short', person: featured.display_name });
   const lootBlock = withWorldState && worldLoot ? `\n【今日镇内异变】
 今天全镇居民都受到同一个效果影响，world_state 必须围绕它展开，不得自创其他状态：
-- 类型：${worldLoot.kind === 'transform' ? '变身形态（每个居民变成一种拟人特殊形态）' : '服装（每个居民换上同一主题的服装）'}
+- 类型：${worldLoot.kind === 'transform' ? '变身形态（全镇每个居民都变成素材指定的同一种拟人形态）' : '服装（每个居民换上同一主题的服装）'}
 - 名称：${worldLoot.name}
 - 效果主题（外观细节以此为准）：${worldLoot.theme}
-${worldLoot.kind === 'transform' ? '- 具体变成什么形态由你结合<world_setting>决定，但全镇统一为同一种，且全天保持' : '- 服装的具体款式细节按上面的效果主题演绎，全镇统一'}` : '';
+${worldLoot.kind === 'transform' ? '- 形态已由编辑部锁定为上面的「名称」与「效果主题」：全镇每个居民都变成这同一种形态，器官组合严格按效果主题、不得增删或替换，禁止写成各家长不同器官；具体外观细节可在主题范围内演绎，全天保持一致' : '- 服装的具体款式细节按上面的效果主题演绎，全镇统一'}` : '';
 
-  return `今天是 ${getLocalDateKey()}（${weekday}）。${weatherNote ? `今日天象参考：${weatherNote}。` : ''}
+  return `今天是 ${getProgramDateKey()}（${weekday}）。${weatherNote ? `今日天象参考：${weatherNote}。` : ''}
 主编，请基于<world_setting>演算今天的报纸${withWorldState ? '，并按格式附上今天的 world_state' : ''}。
 
 【今日主角】${featured.display_name}

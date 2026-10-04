@@ -9,6 +9,9 @@
 import { getDb, getSystemRules, getWorldSetting } from '../db/index.js';
 import { chatSync } from '../llm/llm-client.js';
 import { config } from '../config.js';
+// 玩家信息块的**唯一实现**在 characterPersona（私聊/群聊两条主链也用它）。
+// 这里 import 时改名，避免和本文件下面那个同名适配层互相遮蔽（否则会自己调自己、无限递归）。
+import { buildUserInfoBlock as buildPersonaUserInfoBlock } from './characterPersona.js';
 import { splitText } from '../utils/sentenceSplitter.js';
 import {
   loadEmotionState, getCompositeEmotion,
@@ -17,6 +20,42 @@ import {
 import { broadcast } from './unifiedStreamBus.js';
 import { getTempWakeUntil } from './scheduleManager.js';
 import { getCurrentDream, markDreamShared } from './dreamService.js';
+
+/**
+ * 组装 `<user_info>` 块（玩家本人的设定：昵称 / 性别 / 外观 / 自我描述）。
+ *
+ * 2026-10-02 用户反馈「角色对话还是有一些不遵从设定，和玩家的性别与自我描述」：
+ * 两条"非主链"（叫醒 wakeService、延迟回复 replyQueueScheduler）原先只推 nickname / gender / appearance，
+ * **persona（玩家的自我描述）被整条丢掉**；而私聊主链（`routes/chat.js` 的 `<user_info>`）是带「其他说明：」的
+ * ⇒ 同一份用户设定在不同链路口径不一致，用户感知就是"有时听设定、有时不听"。
+ *
+ * ⚠️ 2026-10-02 第二次收口：**本函数现在只是适配层**，正文（字段拼装 + 遵从约束句）住在
+ * `services/characterPersona.js` 的 `buildUserInfoBlock` —— 因为私聊/群聊两条主链也要同一份措辞，
+ * 一个概念两处实现迟早"改一处漏一处"（persona 就是这么被漏掉的）。
+ * 这里只负责两件私聊/群聊链不需要的事：
+ *   1. **包上 `<user_info>…</user_info>` 标签**（叫醒/延迟回复链的历史契约，调用方直接塞 prompt）；
+ *   2. **空值门控**：四个字段全空 ⇒ 返回 `null`，调用方据此不推这一段。
+ *
+ * 三条口径（以后改这里别退回去）：
+ * 1. 四个字段都要进，persona 用「其他说明：」措辞，与私聊主链**逐字一致**；
+ * 2. **门控也要带上 persona** —— 否则"只有 persona、其余为空"时整块会被跳过（用户的自我描述写了等于没写）；
+ * 3. 末尾必须有**遵从约束**：同 prompt 里 `<user_relation>` 明确写着身份优先级最高，而这里原来只是一句事实陈述，
+ *    模型容易不当回事（把玩家写成相反性别、或直接拿角色自己的性别/身份顶替）。
+ *
+ * @param {string} userName 展示给模型看的玩家名
+ * @returns {string|null} 四个字段全空时返回 null（调用方据此决定要不要推这一段）
+ */
+export function buildUserInfoBlock(userName) {
+  const u = config.user || {};
+  // 门控：四个字段里有任意一个"非空字符串"才算填过。
+  // 只认字符串是为了和 characterPersona 那边的口径一致（`appearance: 0` 之类不能被当成"填了"）。
+  const hasAny = ['nickname', 'gender', 'appearance', 'persona']
+    .some((k) => typeof u[k] === 'string' && u[k].trim());
+  if (!hasAny) return null;
+  // worldHint 显式关掉：那两句世界观性别衔接是给私聊/群聊主链的，叫醒与延迟回复链保持原有文本形态。
+  const body = buildPersonaUserInfoBlock(u, { style: 'chat', displayName: userName, worldHint: false });
+  return `<user_info>${body}</user_info>`;
+}
 
 /**
  * 处理叫醒：构建 LLM 上下文 → 生成回复 → 写入 DB → 广播 SSE
@@ -195,13 +234,10 @@ function buildWakeContext(char, conversationId, userName, mode, attempts, dream 
   if (userRel?.is_oath) {
     relParts.push(`<oath_bond>你们之间有一个比普通关系更深一层的约定——${userName}曾经郑重地送过你一枚戒指。这代表了独一无二的羁绊和承诺。在对话中，你的行为和情感会自然地带有"你是我最重要的人"的底色——不是因为规则要求，而是因为这层羁绊已经是你内心的一部分。</oath_bond>`);
   }
-  if (config.user.nickname || config.user.gender || config.user.appearance) {
-    const infoParts = [];
-    infoParts.push(`消息中标记为"user"的人是"${userName}"`);
-    if (config.user.gender) infoParts.push(`性别：${config.user.gender}`);
-    if (config.user.appearance) infoParts.push(`外观特征：${config.user.appearance}`);
-    relParts.push(`<user_info>${infoParts.join('。')}</user_info>`);
-  }
+  // 用户信息（昵称/性别/外观/自我描述 + 遵从约束）—— 统一走 buildUserInfoBlock，
+  // 与私聊主链、延迟回复链共用同一口径（见该函数上方注释：persona 曾被整条丢掉）。
+  const userInfoBlock = buildUserInfoBlock(userName);
+  if (userInfoBlock) relParts.push(userInfoBlock);
   if (relParts.length > 0) {
     msgs.push({ role: 'system', content: relParts.join('\n') });
   }

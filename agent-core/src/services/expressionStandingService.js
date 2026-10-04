@@ -15,7 +15,11 @@ import { getImageDir, buildImageUrl, deleteImageFileByUrl } from './imagePaths.j
 import { postProcessAsset } from './town/assetPostProcess.js';
 import { broadcast } from './unifiedStreamBus.js';
 import { getStandingDisplay } from './standingDisplay.js';
-import { parseStandingPrompts, runStandingBatch, STANDING_PREFIX } from './expressionStandingPipeline.js';
+import { parseStandingPrompts, runStandingBatch, frameStandingPrompt } from './expressionStandingPipeline.js';
+// 世界观签名（与主立绘同一套口径，见 services/worldSignature.js）：槽位生成时记下"哪个世界观"
+import { currentWorldSignature, isStandingStale } from './worldSignature.js';
+import { buildTouchLineMessages, readTouchLines, startTouchLines, hasTouchLines } from './standingTouchLines.js';
+import { getWorldIntegrationRule } from '../builtinRules.js';
 
 const CATEGORY = 'expression_standing';
 const busyCharacters = new Set();
@@ -49,9 +53,14 @@ export function listExpressionStandings(id) {
   character(id);
   const rows = getDb().prepare('SELECT * FROM character_expression_standings WHERE character_id=?').all(id);
   return {
+    touchLines: readTouchLines(getDb(), id),
     slots: standingSlots().map(s => {
       const row = rows.find(r => r.slot_id === s.id);
-      return { ...s, ...row, generation: JSON.parse(row?.config_json || '{}'), bounds: JSON.parse(row?.bounds_json || 'null') };
+      const slot = { ...s, ...row, generation: JSON.parse(row?.config_json || '{}'), bounds: JSON.parse(row?.bounds_json || 'null') };
+      // 世界观一致性（2026-10-01，与主立绘同一口径）：这一槽是否还吻合"当前世界观"。
+      // 逐槽判定：换世界观后只需重出缺的那些，不必整批 16 张（与 §一-3 的槽位级只补缺口径一致）。
+      const info = isStandingStale({ standing_url: slot.image_url, standing_world_sig: slot.world_sig });
+      return { ...slot, world_stale: info.stale, world_stale_reason: info.reason };
     }),
     jobs: getDb().prepare('SELECT * FROM expression_standing_jobs WHERE character_id=? ORDER BY created_at DESC,rowid DESC LIMIT 10').all(id).map(job => ({ ...job, resumable: job.status === 'failed' && job.error === '服务重启导致生成中断，请重试' })),
     busy: busyCharacters.has(Number(id)),
@@ -61,6 +70,42 @@ export function listExpressionStandings(id) {
 function snapshotConfig(char) {
   return structuredClone({ ...captureImageGenerationConfig('portrait'), artist: charArtistOverride(char) ?? config.comfyui.momentsArtist, loras: parseCharacterLoras(char), ...(char.custom_workflow ? { customWorkflow: char.custom_workflow } : {}), width: 768, height: 1536 });
 }
+/** One snapshot for the tavern manager, including characters with no saved slots. */
+export function listStandingOverview() {
+  const db = getDb();
+  const slots = standingSlots();
+  const images = new Map();
+  for (const row of db.prepare('SELECT character_id,slot_id FROM character_expression_standings WHERE image_url IS NOT NULL AND image_url != ?').all('')) {
+    if (!images.has(row.character_id)) images.set(row.character_id, new Set());
+    images.get(row.character_id).add(row.slot_id);
+  }
+  return db.prepare(`SELECT c.id, j.status AS jobStatus, j.error AS error FROM characters c
+    LEFT JOIN expression_standing_jobs j ON j.id = (
+      SELECT id FROM expression_standing_jobs WHERE character_id=c.id ORDER BY created_at DESC,rowid DESC LIMIT 1
+    ) ORDER BY c.id`).all().map(row => {
+    const missingSlotIds = slots.filter(s => !images.get(row.id)?.has(s.id)).map(s => s.id);
+    const touch = readTouchLines(db,row.id);
+    return { ...row, hasTouchLines:hasTouchLines(touch), touchStatus:touch.status, count: slots.length - missingSlotIds.length, total: slots.length, missingSlotIds, busy: busyCharacters.has(row.id) };
+  });
+}
+
+export function startAllStandingBatches({ mode, requirement = '' } = {}, dependencies) {
+  if (!['all', 'missing'].includes(mode)) throw fail('请选择全部重新生成或补齐缺失立绘');
+  const result = { started: [], skippedBusy: [], skippedComplete: [], failed: [] };
+  for (const row of listStandingOverview()) {
+    if (row.busy) { result.skippedBusy.push(row.id); continue; }
+    if (mode === 'missing' && !row.missingSlotIds.length) { result.skippedComplete.push(row.id); continue; }
+    try {
+      const task = startStandingBatch(row.id, {
+        ...(mode === 'missing' ? { slotIds: row.missingSlotIds } : {}),
+        requirement, reusePrompts: false,
+      }, dependencies);
+      result.started.push({ characterId: row.id, ...task });
+    } catch (error) { result.failed.push({ characterId: row.id, error: error.message }); }
+  }
+  return result;
+}
+
 export async function generateStandingPrompts(char, slots, requirement, persona = buildCharacterPersona(char, { variant: 'short', person: char.display_name })) {
   const messages = buildStandingPromptMessages({
     systemRules: getWorldSetting() ? getSystemRulesWithWorld({ roleplay: false }) : getSystemRules({ roleplay: false }),
@@ -99,7 +144,7 @@ async function commitImage(id, slot, buffer, { removeBg = true, source = true } 
   try {
     fs.writeFileSync(path.join(dir, filename), output);
     if (source) fs.writeFileSync(path.join(dir, sourceName), await sharp(sourceBuffer, { limitInputPixels: 67108864 }).png().toBuffer());
-    const result = getDb().prepare(`UPDATE character_expression_standings SET image_url=?,source_url=CASE WHEN ? IS NULL THEN source_url ELSE ? END,bounds_json=?,status='done',error=NULL,version=version+1 WHERE character_id=? AND slot_id=? AND version=?`).run(url, source ? sourceName : null, source ? buildImageUrl(CATEGORY, sourceName) : null, JSON.stringify(bounds), id, slot, previous.version);
+    const result = getDb().prepare(`UPDATE character_expression_standings SET image_url=?,source_url=CASE WHEN ? IS NULL THEN source_url ELSE ? END,bounds_json=?,world_sig=?,status='done',error=NULL,version=version+1 WHERE character_id=? AND slot_id=? AND version=?`).run(url, source ? sourceName : null, source ? buildImageUrl(CATEGORY, sourceName) : null, JSON.stringify(bounds), currentWorldSignature(), id, slot, previous.version);
     if (!result.changes) throw fail('立绘已被修改或角色已删除，请刷新', 409);
   } catch (error) {
     for (const file of [filename, sourceName]) { try { fs.unlinkSync(path.join(dir, file)); } catch {} }
@@ -111,7 +156,26 @@ async function commitImage(id, slot, buffer, { removeBg = true, source = true } 
   notify(id);
 }
 
-export function startStandingBatch(id, { slotIds, requirement = '', reusePrompts = false } = {}, { promptGenerator = generateStandingPrompts, imageGenerator = generateImageRaw } = {}) {
+export function generateStandingTouchLines(char) {
+  const relationship=getDb().prepare('SELECT relationship_text, affinity, is_oath FROM user_relationships WHERE character_id=?').get(char.id);
+  const messages=buildTouchLineMessages(char, {
+    relationship,userName:config.user.nickname || '用户',
+    systemRules:getSystemRulesWithWorld({roleplay:false}),
+    worldRule:getWorldSetting()?getWorldIntegrationRule('interaction'):'当前未启用世界观，按角色资料与本次任务创作，不补造世界设定。',
+  });
+  return chatSync(messages, { temperature: 0.8, max_tokens: 3000, response_format: { type: 'json_object' }, label: '立绘触摸台词', signal: AbortSignal.timeout(90000), timeout: 90000, retries: 0, maxRetries: 0, freeEggFailover: false });
+}
+
+export function regenerateStandingTouchLines(id, expectedVersion) {
+  const char=character(id),db=getDb(),current=readTouchLines(db,char.id);
+  if(current.status==='generating')throw fail('台词正在生成，请稍候',409);
+  if(expectedVersion!==current.version)throw fail('台词已更新，请重新读取',409);
+  startTouchLines({db,character:char,generate:generateStandingTouchLines,emit:broadcast})
+    ?.catch(error=>console.warn('[standing-touch] 台词保存失败:',error.message));
+  return readTouchLines(db,char.id);
+}
+
+export function startStandingBatch(id, { slotIds, requirement = '', reusePrompts = false } = {}, { promptGenerator = generateStandingPrompts, imageGenerator = generateImageRaw, touchLinesGenerator = generateStandingTouchLines } = {}) {
   id = Number(id); assertIdle(id);
   const char = character(id);
   const all = standingSlots();
@@ -156,7 +220,8 @@ export function startStandingBatch(id, { slotIds, requirement = '', reusePrompts
           db.prepare(`UPDATE character_expression_standings SET status='generating' WHERE character_id=? AND slot_id=?`).run(id, slot.id);
           notify(id);
           const opts = JSON.parse(row.config_json);
-          const framedPrompt = prompt.startsWith(STANDING_PREFIX) ? prompt : `${STANDING_PREFIX}, ${prompt}`;
+          // 最终阀门：不论提示词来自本次生成、库里复用还是用户手改，进 ComfyUI 前一律补上固定前置（solo 开头）。
+          const framedPrompt = frameStandingPrompt(prompt);
           const result = await imageGenerator(framedPrompt, { ...opts, scene: 'portrait', workflowScene: null, promptScene: 'avatar', priority: 'high', disableRAG: true, alreadyPrepared: true, persistPreparation: false });
           if (!result.success || !result.images?.length) throw new Error(result.error || '未返回立绘图片');
           await commitImage(id, slot.id, decodeImage(result.images[0].base64));
@@ -181,6 +246,13 @@ export function startStandingBatch(id, { slotIds, requirement = '', reusePrompts
   };
   control.run = run;
   queue = queue.then(run, run);
+  if (slots.length === all.length && !reusePrompts && !hasTouchLines(readTouchLines(db,id))) {
+    // A text-task startup/storage failure must not strand the queued image job.
+    try {
+      startTouchLines({ db, character: char, generate: touchLinesGenerator, emit: broadcast })
+        ?.catch(error => console.warn('[standing-touch] 后台台词任务保存失败:', error.message));
+    } catch (error) { console.warn('[standing-touch] 后台台词任务启动失败:', error.message); }
+  }
   return { jobId };
 }
 

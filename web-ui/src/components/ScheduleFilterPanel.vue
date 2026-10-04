@@ -70,8 +70,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import LinsheButton from './ui/LinsheButton.vue'
+import { getProgramTime } from '../api/timeControl.js'
+import { programTimeViewModel } from './timeControlLogic.js'
 
 const props = defineProps<{
   characters: any[]
@@ -83,9 +85,34 @@ defineEmits(['filter', 'search', 'select-char'])
 
 const searchText = ref('')
 
-const WD = ['周日','周一','周二','周三','周四','周五','周六']
-const now = new Date()
-const timeText = `${WD[now.getDay()]} ${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`
+/**
+ * 面板顶部时钟：「现在是程序世界的几点」。
+ *
+ * 2026-10-02 修（用户：「调时…不在其他的覆盖范围」）：原来是模块加载时
+ * `new Date()` 算一次、之后永不更新的常量 —— 世界钟拨到别的时间后它仍显示现实钟点，
+ * 而下面的日程数据是按**程序日期键**取的，两者会互相打架。
+ * 现在吃程序时间（后端 `GET /api/time`，偏移只在后端算）：挂载时拉一次 + 30s 静默刷新；
+ * 滚动 / 切筛选都不重新请求。读不到就让这一行空着 —— 不拿现实钟点冒充世界钟。
+ */
+const CLOCK_POLL_MS = 30000
+const timeText = ref('')
+let clockTimer: ReturnType<typeof setInterval> | null = null
+
+async function refreshClock() {
+  try {
+    const view = programTimeViewModel(await getProgramTime())
+    if (view.ok) timeText.value = [view.weekday, view.clockText].filter(Boolean).join(' ')
+  } catch { /* 读不到程序时间：这一行留空，不阻塞日程面板其它部分 */ }
+}
+
+onMounted(() => {
+  refreshClock()
+  clockTimer = setInterval(refreshClock, CLOCK_POLL_MS)
+})
+
+onUnmounted(() => {
+  if (clockTimer) { clearInterval(clockTimer); clockTimer = null }
+})
 
 const available = computed(() => props.characters.filter(c => !c.is_sleeping && c.reply_delay === 0).length)
 const busy = computed(() => props.characters.filter(c => !c.is_sleeping && c.reply_delay > 0).length)

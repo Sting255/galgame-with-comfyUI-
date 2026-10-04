@@ -13,8 +13,9 @@
 import { getDb, getWorldSetting, getSystemRules } from '../db/index.js';
 import { chatSync } from '../llm/llm-client.js';
 import { config } from '../config.js';
-import { getLocalDateKey } from '../utils/localDate.js';
+import { getProgramDateKey, toSqlUtc } from './programTime.js';
 import { getWorldIntegrationRule } from '../builtinRules.js';
+import { reapplyActiveEventSchedule } from './eventSchedule.js';
 
 /**
  * 截取角色人格 prompt：从开头到 "##你的外观" 之前
@@ -105,6 +106,17 @@ export async function generateSchedule(character, direction) {
 不留任何空白分钟。所有时间必须被完整覆盖。如果日程从 03:00 开始，
 那么 00:00~03:00 也必须有一个活动覆盖（可以是睡眠或深夜活动）。
 
+## 跨零点睡眠块（极容易出错，务必照做）
+睡眠块可以跨零点（例如 22:00 → 07:00 表示「22 点睡、次日 7 点起」）。
+**跨零点的睡眠块已经覆盖了零点之后的那段时间，因此禁止再安排任何与它重叠的活动。**
+真机上出现过的错误例子：睡眠块写 22:00 → 07:00，同时又写了 00:00 → 05:00 的「深夜巡查」——
+这两段在真实时间里是重叠的（深夜巡查被睡眠盖住），整份日程会被判为无效。
+两种合法写法，任选其一：
+- 深夜活动排在睡眠**之前**：20:00 → 22:00「深夜巡逻」，然后 22:00 → 07:00「就寝安眠」；
+- 把睡眠**拆成两段**互不重叠：22:00 → 02:00「就寝」+ 02:00 → 07:00「继续睡」，
+  深夜活动放在别处（例如 07:00 之后）。
+判断标准很简单：**把每条活动按 00:00 展开成一条时间轴，任意两段不许有交集，且合起来正好是 24 小时。**
+
 每个活动对象格式（description 必填，20-40 字，禁止空字符串或只写标点）：
 {
   "startTime": "HH:MM",
@@ -155,14 +167,16 @@ ${directionMsg}`;
     try {
       rawResult = await chatSync(msgs, {
         temperature: 0.5,
-        max_tokens: 2048,
+        // 2026-10-01：2048 → 4096。真机复现实测：14~16 段的日程输出就已经到 1500+ tokens、
+        // 原文 5000+ 字符；话多的角色（纳西妲/风瑾）会顶到 2048 上限**被截断**，
+        // 表现正是日志里那类 `JSON parse failed`（截断的 JSON 当然解析不了）。
+        max_tokens: 4096,
         response_format: { type: 'json_object' },
         label: `schedule-gen:${character.display_name}`,
       });
 
       const schedule = parseAndValidateSchedule(rawResult, character.display_name);
-      if (schedule) {
-        const json = JSON.stringify(schedule);
+      if (schedule) {        const json = JSON.stringify(schedule);
         const existing = db.prepare('SELECT id, version FROM schedule_templates WHERE character_id = ?').get(character.id);
 
         if (existing) {
@@ -194,9 +208,113 @@ ${directionMsg}`;
 }
 
 /**
- * 解析并校验 LLM 输出的日程 JSON
+ * LLM 原始输出的**带标记截断预览**（2026-10-01）。
+ *
+ * 为什么必须加：日志取证发现后端把 LLM 返回体**静默截断到约 320 字符、且不加任何标记**，
+ * 于是"成功"的样本和"失败"的样本看起来停在同一位置（都停在一个词中间），
+ * 三月七的日程生成失败**因此完全无法从日志判断根因**。
+ * 现在任何一次校验失败都会打一条带「共 N 字符 / 已截断」的预览；
+ * 需要看全文时设环境变量 `SCHEDULE_GEN_DUMP=1`。
+ */
+function scheduleRawPreview(raw, limit = 400) {
+  const text = String(raw ?? '');
+  const head = text.slice(0, limit).replace(/\s+/g, ' ');
+  return text.length > limit ? `${head} …（共 ${text.length} 字符，已截断）` : head;
+}
+
+function dumpScheduleRaw(raw, displayName, reason) {
+  console.warn(`[scheduleGen] ${displayName} ${reason}；原始输出预览：${scheduleRawPreview(raw)}`);
+  if (process.env.SCHEDULE_GEN_DUMP === '1') {
+    console.warn(`[scheduleGen] ${displayName} 原始输出全文（${String(raw ?? '').length} 字符）：\n${String(raw ?? '')}`);
+  }
+}
+
+/** 分钟 → "HH:MM"（负数/超 1440 自动回绕） */
+function minutesToHHMM(minutes) {
+  const m = ((Math.trunc(minutes) % 1440) + 1440) % 1440;
+  return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+}
+
+/**
+ * 确定性修复：**睡眠块优先**，把被它盖住的非睡眠活动裁掉。
+ *
+ * 为什么需要（2026-10-01，有真机失败样本）：
+ * 复现时抓到德丽莎的失败原文 —— 模型先排 `00:00→05:00「深夜学生宿舍巡查」`，
+ * 又排了一个跨零点的睡眠块（如 `22:00→07:00「就寝安眠」`）。两段在真实时间里**重叠**
+ * （深夜巡查整段被睡眠盖住），校验直接判死，只能靠"再来一次"碰运气 ——
+ * 日志里 4 次失败有 3 次是这么被重试救回来的，剩下那次（三月七）连输两次就成了用户看到的失败。
+ *
+ * 这类冲突**有唯一合理解法**，不需要重掷骰子：
+ *   · 睡眠是不可让位的（replyDelay=-1 段决定了她的作息与消息队列行为）；
+ *   · 非睡眠段里与睡眠重叠的分钟**本来就已被睡眠覆盖**，删掉它不会造成任何时间空档
+ *     ⇒ **覆盖不变性**：本函数只做"减法"，且减掉的每一分钟都仍在睡眠块里 ⇒ 24 小时覆盖必然保持。
+ *   · 若一段被睡眠从中间切开（睡眠夹在它内部），会切成两段相邻的子段，时间上仍然首尾相接。
+ * 返回新数组；没有冲突时返回原数组（**逐字节不变**，保证干净日程不受影响）。
+ */
+export function repairScheduleOverlaps(activities) {
+  if (!Array.isArray(activities) || activities.length === 0) return activities;
+  const sleepBlocks = activities.filter(a => a && a.replyDelay === -1);
+  if (sleepBlocks.length === 0) return activities;
+
+  // 睡眠占用位图（1440 分钟），跨零点段展开后取模
+  const sleepMask = new Uint8Array(1440);
+  for (const block of sleepBlocks) {
+    let s = timeToMinutes(block.startTime);
+    let e = timeToMinutes(block.endTime);
+    if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
+    if (e <= s) e += 1440;
+    for (let m = s; m < e; m++) sleepMask[((m % 1440) + 1440) % 1440] = 1;
+  }
+
+  let changed = false;
+  const out = [];
+  for (const act of activities) {
+    if (!act || act.replyDelay === -1) { out.push(act); continue; }
+    let s = timeToMinutes(act.startTime);
+    let e = timeToMinutes(act.endTime);
+    if (!Number.isFinite(s) || !Number.isFinite(e)) { out.push(act); continue; }
+    if (e <= s) e += 1440;
+    const free = [];
+    for (let m = s; m < e; m++) if (!sleepMask[((m % 1440) + 1440) % 1440]) free.push(m);
+    if (free.length === e - s) { out.push(act); continue; }   // 完全没冲突
+
+    changed = true;
+    if (free.length === 0) continue;                           // 整段被睡眠盖住 → 丢弃
+    // 连续段切分（被睡眠从中间切开时得到两段相邻子段）
+    const runs = [];
+    let runStart = free[0];
+    let prev = free[0];
+    for (let i = 1; i < free.length; i++) {
+      if (free[i] === prev + 1) { prev = free[i]; continue; }
+      runs.push([runStart, prev + 1]);
+      runStart = free[i];
+      prev = free[i];
+    }
+    runs.push([runStart, prev + 1]);
+    for (const [rs, re] of runs) {
+      out.push({ ...act, startTime: minutesToHHMM(rs), endTime: minutesToHHMM(re) });
+    }
+  }
+
+  if (!changed) return activities;
+  out.sort((a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
+  return out;
+}
+
+/**
+ * 解析并校验 LLM 输出的日程 JSON。
+ *
+ * 真正的实现是下面的 `validateScheduleInner`；本函数是**带失败回显的包装**：
+ * 失败时统一补一条原始输出预览（具体原因仍由 inner 里各自的 warn 说明），
+ * 这样"校验为什么没过"永远能从日志里看出来。
  */
 export function parseAndValidateSchedule(raw, displayName) {
+  const result = validateScheduleInner(raw, displayName);
+  if (!result) dumpScheduleRaw(raw, displayName, '日程校验未通过（具体原因见上一条 warn）');
+  return result;
+}
+
+function validateScheduleInner(raw, displayName) {
   let activities;
 
   // 优先尝试完整 JSON 解析（兼容 json_object 模式的 {"activities":[...]} 和旧格式 [...]）
@@ -267,6 +385,16 @@ export function parseAndValidateSchedule(raw, displayName) {
   }
 
   // 校验时间不重叠
+  // 2026-10-01：先做**确定性修复**（睡眠块优先，裁掉与它重叠的非睡眠段），再判重叠。
+  // 真机抓到的失败样本正是这一类（跨零点睡眠块 vs 深夜活动），修完覆盖不变、也不会再掷骰子。
+  {
+    const repaired = repairScheduleOverlaps(activities);
+    if (repaired !== activities) {
+      const before = activities.length;
+      console.warn(`[scheduleGen] 修掉了与跨零点睡眠块重叠的时段（${displayName}）：${before} → ${repaired.length} 段`);
+      activities = repaired;
+    }
+  }
   for (let i = 0; i < activities.length; i++) {
     for (let j = i + 1; j < activities.length; j++) {
       if (timeRangesOverlap(
@@ -466,7 +594,7 @@ export function assignNextRefreshTime(characterId) {
   const refreshAt = new Date(target.getTime() + randomOffset);
 
   db.prepare('UPDATE characters SET next_schedule_refresh_at = ? WHERE id = ?')
-    .run(refreshAt.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '').replace(/Z$/, ''), characterId);
+    .run(toSqlUtc(refreshAt), characterId);
 
   console.log(`[scheduleGen] Next refresh for char ${characterId}: ${refreshAt.toISOString()}`);
   return refreshAt;
@@ -474,23 +602,26 @@ export function assignNextRefreshTime(characterId) {
 
 /**
  * 为角色创建当天的 daily_schedules 快照（从 template 派生）
+ * 「当天」= **程序日期**（推进程序时间之后，快照落在世界钟的那一天；偏移为 0 时即真实今天）
  */
 export function snapshotTodaySchedule(characterId) {
   const db = getDb();
   const template = db.prepare('SELECT schedule_json FROM schedule_templates WHERE character_id = ?').get(characterId);
   if (!template) return null;
 
-  const today = getLocalDateKey();
+  const today = getProgramDateKey();
 
   db.prepare(`
     INSERT OR REPLACE INTO daily_schedules (character_id, schedule_date, schedule_json)
     VALUES (?, ?, ?)
   `).run(characterId, today, template.schedule_json);
+  reapplyActiveEventSchedule(characterId, db);
 
-  // 清理超过 2 天的旧快照
+  // 清理超过 2 天的旧快照（按程序日期算，跳天之后不会误删/漏删）
   db.prepare(
-    `DELETE FROM daily_schedules WHERE character_id = ? AND schedule_date < DATE('now', 'localtime', '-2 days')`
-  ).run(characterId);
+    `DELETE FROM daily_schedules WHERE character_id = ? AND schedule_date < date(?, '-2 days')`
+  ).run(characterId, today);
 
-  return template.schedule_json;
+  return db.prepare('SELECT schedule_json FROM daily_schedules WHERE character_id = ? AND schedule_date = ?')
+    .get(characterId, today).schedule_json;
 }

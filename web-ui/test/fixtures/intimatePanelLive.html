@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>亲密看板 · live 端到端样例（真实后端）</title>
+<style id="fixture-style">
+/* 浏览器回归样例（非产品代码）：本页挂载真实 IntimatePanel.vue，且**不拦截 fetch**，
+   组件的请求真正打到 vite 代理 → agent-core :3099。这里只有样例自己的外壳样式。 */
+html, body { margin: 0; padding: 0; }
+body {
+  box-sizing: border-box;
+  padding: 16px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: var(--fs-base);
+  line-height: 1.55;
+}
+h1 { margin: 0 0 6px; font-size: var(--fs-xl); }
+.sim-hint { max-width: 980px; margin: 0 0 10px; font-size: var(--fs-sm); color: var(--text-secondary); }
+.sim-hint b { color: var(--accent); font-weight: 700; }
+.sim-hint code { font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-xs); }
+#result {
+  max-width: 980px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: var(--fs-xs);
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+#board { max-width: 980px; }
+/* 面板外壳：暖色＝暖纸外壳，暗夜＝深色玻璃（与组件内白色区块形成层级） */
+.sim-panel-shell {
+  max-width: 780px;
+  padding: 14px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+}
+</style>
+</head>
+<body>
+<h1>亲密看板 · live 端到端样例（真实后端）</h1>
+<p class="sim-hint">
+  用途：在<b>不拦截任何 fetch</b> 的前提下挂载真实 <b>IntimatePanel.vue</b>，让组件自己从 agent-core(:3099) 读数据，
+  自检「六区块文案齐全 / 没有区块停在骨架态 / 后端预置的真实字段真的渲染出来 / 无 JS 报错 / 双主题成立」。
+  与 <code>intimatePanel.html</code>（fetch 打桩版）互补：那个查组件漂移，这个查真实链路。
+</p>
+<p class="sim-hint">
+  前置条件：agent-core 用 <b>%TEMP% 临时库</b> 起在 :3099，并已用 REST 预置角色档案与流水；
+  vite dev server 已启动。打开方式：
+  <code>/test/fixtures/intimatePanelLive.html?characterId=&lt;id&gt;&amp;name=&lt;显示名&gt;&amp;height=&lt;身高&gt;&amp;note=&lt;备注&gt;&amp;zones=&lt;敏感带条数&gt;&amp;zoneLabels=&lt;部位1|部位2&gt;&amp;acts=&lt;行为种类数&gt;&amp;logs=&lt;流水条数&gt;&amp;totalActs=&lt;总次数&gt;&amp;totalActsUserChar=&lt;只算 user+character 的总次数&gt;&amp;topPosition=&lt;首位体位&gt;&amp;topAct=&lt;首个行为&gt;&amp;firstAct=&lt;初次行为&gt;&amp;firstDate=&lt;初次日期&gt;</code>
+  （查询参数只是「期望值」，数据本身仍由组件从后端读取），加 <code>&amp;theme=dark</code> 以暗夜主题打开。
+</p>
+<pre id="result">Running…</pre>
+<div id="board"><div id="panel-host" class="sim-panel-shell"></div></div>
+<script type="module" src="./intimatePanelLive.js"></script>
+</body>
+</html>

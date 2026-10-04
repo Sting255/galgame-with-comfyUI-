@@ -1,3 +1,9 @@
+## 工作模式（开工必读）
+
+本仓库自带开发约定，见 `docs/` 与 `README.md`：它规定动手前按什么顺序读、每轮怎么验（L1 定向单测 → L6 浏览器点击）、硬纪律（内存库 / 产物重建 / 真实库保护 / Linshe 组件与 LLM prompt 口径）、什么时候必须停下来问用户、收工要更新哪几份文档。
+
+**任何 AI 接手本仓库，第一件事就是读它。** 它与本文件不冲突：本文件管**全仓契约**，那份约定管**执行手段**；两者冲突时以本文件为准。
+
 ## UI / UX
 
 所有 UI 修改、新功能设计、页面设计必须遵循 `docs/design-system.md`。
@@ -82,7 +88,7 @@ web-ui 中所有分段选择 / 页签统一使用组件 `web-ui/src/components/u
 web-ui 中所有弹窗统一使用组件 `web-ui/src/components/ui/LinsheModal.vue`（原 `BaseModal.vue` 已改名收编），禁止手写遮罩 / 面板皮肤。
 
 1. 引入：`import LinsheModal from '.../components/ui/LinsheModal.vue'`，模板中写 `<linshe-modal>`；`v-model` 控制显隐（旧代码仍可传 `:visible`），`title` 为标题
-2. 尺寸用 `wide`（加宽）/ `full`（大型管理面板）；内容用默认插槽，底部操作区用 `#footer`，头部右侧附加内容（如计数）用 `#header-extra`；需要局部布局差异用 `panel-class` / `body-class`
+2. 尺寸用 `wide`（加宽）/ `full`（大型管理面板）；内容用默认插槽，底部操作区用 `#footer`，头部右侧附加内容（如计数）用 `#header-extra`；需要局部布局差异用 `panel-class` / `body-class`；需要「相对所属页面而不是整个视口居中」时传 `anchor`（宿主选择器，如小镇页传 `anchor=".page-host"`，宿主须为定位元素；留空＝视口居中）
 3. 暖色为暖纸外壳 + 白色内衬（标题栏与 `#footer` 留在外壳上、白色内衬只包正文），暗夜保持 Cel Glow 深色玻璃；主题色值一律走 `styles/tokens.css` 的 `--modal-*`；Esc / 点遮罩关闭
 4. 调整弹窗风格只改 `LinsheModal.vue` 与 `tokens.css` 的 `--modal-*`，不要在各页面里覆盖组件皮肤
 

@@ -355,8 +355,13 @@ export function guiToApi(workflow) {
           for (let j = 0; j < missingSlots.length && wvIdx + j < wvs.length; j++) {
             apiNode.inputs[missingSlots[j].name] = wvs[wvIdx + j] ?? '';
           }
-          console.log(`[comfyClient] ${node.type}(id=${node.id}) hardcoded fallback:`,
-            missingSlots.map((f, j) => `${f.name}=${JSON.stringify(wvs[wvIdx + j])}`).join(', '));
+          // 2026-10-01：只有真的补了槽位才打印。原来无条件打印，于是日志里天天出现
+          // `[comfyClient] PrimitiveInt(id=122) hardcoded fallback:`（冒号后面空白），
+          // 看起来像「填了空值导致生不出图」，实际是 missingSlots 为空 —— 纯噪声，会带偏排查。
+          if (missingSlots.length > 0) {
+            console.log(`[comfyClient] ${node.type}(id=${node.id}) hardcoded fallback:`,
+              missingSlots.map((f, j) => `${f.name}=${JSON.stringify(wvs[wvIdx + j])}`).join(', '));
+          }
         }
       }
     }

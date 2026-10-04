@@ -1,9 +1,8 @@
 <template>
   <Teleport to="body">
-    <ExpressionStandingManager :open="visible && showExpressionStandings" :character="character" @close="showExpressionStandings = false" />
     <!-- ── 角色详情弹窗 ── -->
     <Transition name="modal-fade">
-      <div v-if="visible && !showLoraModal && !showOutfitModal && !showRefineModal && !showExpressionStandings" class="modal-overlay" @mousedown="onOverlayMouseDown" @click.self="onOverlayClick">
+      <div v-if="visible && !showLoraModal && !showOutfitModal && !showRefineModal && !showIntimateModal && !showExpressionStandings" class="modal-overlay" @mousedown="onOverlayMouseDown" @click.self="onOverlayClick">
         <div class="modal-panel modal-wide detail-panel">
           <div class="modal-header">
             <h3>{{ character?.display_name }}</h3>
@@ -109,6 +108,9 @@
               <linshe-input v-model="detail.editPrompt" type="textarea" class="fi prompt-textarea" @input="detail.dirty = true" />
             </div>
 
+            <!-- SLG 动作系统 · 阶段三：触摸互动统计小节 -->
+            <TouchStatsPanel :character="character" />
+
             <!-- 移动端「更多设置」：桌面端是右侧悬浮面板，手机端收进正文末尾，保持内容优先 -->
             <div class="mobile-detail-toolbar" v-if="isMobile">
               <div class="toolbar-title">
@@ -129,7 +131,7 @@
                 <span>不发生奇遇</span>
                 <linshe-switch v-model="detail.eventsDisabled" size="sm" :disabled="detail.eventsToggling" @change="toggleEventsDisabled" aria-label="不发生奇遇" />
               </div>
-              <div class="toolbar-item toolbar-item-btn" @click="openLoraModal">
+              <div class="toolbar-item toolbar-item-btn" role="button" tabindex="0" @click="openLoraModal" @keydown.enter.prevent="openLoraModal" @keydown.space.prevent="openLoraModal">
                 <span>设置 Lora</span>
                 <span v-if="hasLoraSetup" class="toolbar-badge active">已配置</span>
                 <span v-else class="toolbar-badge">未配置</span>
@@ -140,6 +142,10 @@
                 <span v-if="activeOutfitName" class="toolbar-badge active">{{ activeOutfitName }}</span>
                 <span v-else class="toolbar-badge">未启用</span>
               </div> -->
+              <div class="toolbar-item toolbar-item-btn" role="button" tabindex="0" @click="openIntimateModal" @keydown.enter.prevent="openIntimateModal" @keydown.space.prevent="openIntimateModal">
+                <span>亲密信息</span>
+                <span class="toolbar-badge">看板</span>
+              </div>
             </div>
 
             <!-- 角色立绘（手机端）：桌面端是左侧悬浮窗，手机端收在正文末尾 -->
@@ -153,10 +159,6 @@
               <linshe-button variant="secondary" @click="openRefineModal">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 16 11-11a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" /><path d="m13 7 3 3M19 13v6m-3-3h6M6 2v6M3 5h6" /></svg>
                 修正外观
-              </linshe-button>
-              <linshe-button variant="secondary" @click="showExpressionStandings = true">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3" /><circle cx="12" cy="9" r="3" /><path d="M6 21v-2a6 6 0 0 1 12 0v2" /></svg>
-                立绘管理
               </linshe-button>
               <div class="recruit-appearance-hint">
                 外观描述补充tag查阅
@@ -189,7 +191,7 @@
                 <span class="float-label">不发生奇遇</span>
                 <linshe-switch v-model="detail.eventsDisabled" :disabled="detail.eventsToggling" @change="toggleEventsDisabled" aria-label="不发生奇遇" />
               </div>
-              <div class="float-row float-row-action" @click="openLoraModal">
+              <div class="float-row float-row-action" role="button" tabindex="0" @click="openLoraModal" @keydown.enter.prevent="openLoraModal" @keydown.space.prevent="openLoraModal">
                 <span class="float-label">设置 Lora</span>
                 <span v-if="hasLoraSetup" class="float-badge active">已配置</span>
                 <span v-else class="float-badge">未配置</span>
@@ -200,6 +202,10 @@
                 <span v-if="activeOutfitName" class="float-badge active float-badge-name">{{ activeOutfitName }}</span>
                 <span v-else class="float-badge">未启用</span>
               </div> -->
+              <div class="float-row float-row-action" role="button" tabindex="0" @click="openIntimateModal" @keydown.enter.prevent="openIntimateModal" @keydown.space.prevent="openIntimateModal">
+                <span class="float-label">亲密信息</span>
+                <span class="float-badge">看板</span>
+              </div>
             </div>
           </div>
         </div>
@@ -442,6 +448,9 @@ import LinsheSwitch from './ui/LinsheSwitch.vue'
 import LinsheModal from './ui/LinsheModal.vue'
 import ImageLightbox from './ImageLightbox.vue'
 import CharacterStandingPanel from './CharacterStandingPanel.vue'
+import TouchStatsPanel from './TouchStatsPanel.vue'
+import RecentImageCropper from './RecentImageCropper.vue'
+import IntimatePanel from './character/IntimatePanel.vue'
 import ExpressionStandingManager from './ExpressionStandingManager.vue'
 import AppearanceRefineModal from './AppearanceRefineModal.vue'
 import { bustUrlIfOverwritten, overwriteBustTick } from '../utils/imageUrlRefresh.js'
@@ -451,9 +460,6 @@ const props = defineProps({
   visible: { type: Boolean, default: false },
   character: { type: Object, default: null },
 })
-
-const showExpressionStandings = ref(false)
-watch(() => props.visible, value => { if (!value) showExpressionStandings.value = false })
 
 const emit = defineEmits([
   'close',
@@ -502,6 +508,13 @@ const activeLoraFileIdx = ref(null)
 const loraDropdownIdx = ref(-1)
 const loraSuggestions = ref([])
 const loraFetching = ref(false)
+
+// ── 亲密信息看板 ──
+const showIntimateModal = ref(false)
+function openIntimateModal() {
+  if (!props.character) return
+  showIntimateModal.value = true
+}
 
 // ── 外观/形态设置状态 ──
 const showOutfitModal = ref(false)
@@ -569,6 +582,8 @@ function _parseCharLoras(raw) {
 // ═══════════════════════════════════════
 
 watch(() => [props.visible, props.character], ([v, c]) => {
+  // 详情卡收起时一并收起亲密信息子窗，避免留下孤儿弹窗
+  if (!v) showIntimateModal.value = false
   if (v && c) {
     init(c)
   }

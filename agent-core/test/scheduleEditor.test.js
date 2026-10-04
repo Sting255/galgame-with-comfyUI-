@@ -37,20 +37,40 @@ const BASE_DAY = [
   { startTime: '22:00', endTime: '07:00', activity: '就寝安眠', location: '公寓卧室', replyDelay: -1, tags: ['睡眠'], description: '沉入睡眠。' },
 ];
 
-const fmtMin = (m) => `${String(Math.floor((m % 1440) / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
-
-/** 构造一个包含当前时刻、且不跨午夜的时间窗（HH:MM），供特殊队列扫描测试用 */
-function inWindowSlot(duration = 30) {
-  const curMin = new Date().getHours() * 60 + new Date().getMinutes();
-  const start = Math.min(Math.max(curMin, 0), 1439 - duration);
-  return [fmtMin(start), fmtMin(start + duration)];
-}
-
 /** 构造今天固定时刻的 Date（applyScheduleChange 支持 now 注入，测试不受运行时刻影响） */
 function todayAt(h, m = 0) {
   const d = new Date();
   d.setHours(h, m, 0, 0);
   return d;
+}
+
+/**
+ * 把全局 Date 固定到给定的那一瞬间跑一段逻辑，跑完恢复。
+ *
+ * 特殊日程队列的扫描入口 `runSpecialMomentCheck`（= scheduleSpecialMoment.processSpecialMoments）
+ * 只吃真实钟点、没有 now 注入口，而 `src/services/scheduleSpecialMoment.js` 不在本轮允许改动的文件里，
+ * 所以这里用固定钟点桩消掉测试对"当前几点"的依赖：
+ *   · 固定值取"真实今天的某个钟点" → `getLocalDateKey()` 仍是今天，
+ *     `daily_schedules.schedule_date = DATE('now','localtime')` 的查询口径不变；
+ *   · 钟点固定 → "时段内 / 已过期"两条样本不会随真实运行时刻翻转
+ *     （老写法用"当前钟点"造时段内样本、又把已过期样本硬编码成 00:00–00:10，
+ *      于是每天 00:00–00:10 这两条都算"时段内"，必假红）。
+ */
+async function withFixedClock(fixedDate, fn) {
+  const RealDate = globalThis.Date;
+  const fixedMs = fixedDate.getTime();
+  class FixedDate extends RealDate {
+    constructor(...args) {
+      super(...(args.length > 0 ? args : [fixedMs]));
+    }
+    static now() { return fixedMs; }
+  }
+  globalThis.Date = FixedDate;
+  try {
+    return await fn();
+  } finally {
+    globalThis.Date = RealDate;
+  }
 }
 
 test('updateScheduleActivity marks the entry edited and queues it for the special moment', async t => {
@@ -267,44 +287,40 @@ test('applyScheduleChange accepts cross-midnight appointments by clamping to 23:
 test('special moment queue: in-window entries are dispatched, past entries expire, sent marks persist', async t => {
   const db = getDb();
   t.after(() => closeDb());
-  const charId = insertCharWithSchedule(db, '队列测试', BASE_DAY);
-  // 手动写入三种状态的条目：待发送（时段内）、待发送（已过期）、普通条目
-  const [inWinStart, inWinEnd] = inWindowSlot(30);
-  // 已过时段：结束时刻 = 当前分钟（nowMin >= endMin 即判过期，且不可能落进时段内）。
-  // 不能硬编码 00:00~00:10——零点后 10 分钟内运行会误判为"时段内"；
-  // 仅当恰好在 00:00 分这一分钟内运行时无法构造"已过时段"（当天尚无任何已过时刻）
-  const curMin = new Date().getHours() * 60 + new Date().getMinutes();
-  const pastStart = Math.max(curMin - 10, 0);
-  const pastSlot = [fmtMin(pastStart), fmtMin(curMin)];
+  // 固定到真实今天的 12:00 跑完整条用例：扫描时刻与两条样本都固定，
+  // 不再依赖真实钟点（原写法在本地 00:00–00:10 两条都落在"时段内"，必假红）
+  await withFixedClock(todayAt(12), async () => {
+    const charId = insertCharWithSchedule(db, '队列测试', BASE_DAY);
+    // 手动写入三种状态的条目：待发送（时段内 11:50–12:10）、待发送（已过期 00:00–00:10）、普通条目
+    const schedule = loadSchedule(db, charId);
+    schedule.push(
+      { startTime: '11:50', endTime: '12:10', activity: '时段内约定', location: '公园', replyDelay: 0, tags: [], description: '', edited: 1, specialMomentStatus: 'pending' },
+      { startTime: '00:00', endTime: '00:10', activity: '已过时约定', location: '公园', replyDelay: 0, tags: [], description: '', edited: 1, specialMomentStatus: 'pending' },
+    );
+    db.prepare('UPDATE daily_schedules SET schedule_json = ? WHERE character_id = ?')
+      .run(JSON.stringify(schedule), charId);
 
-  const schedule = loadSchedule(db, charId);
-  schedule.push(
-    { startTime: inWinStart, endTime: inWinEnd, activity: '时段内约定', location: '公园', replyDelay: 0, tags: [], description: '', edited: 1, specialMomentStatus: 'pending' },
-    { startTime: pastSlot[0], endTime: pastSlot[1], activity: '已过时约定', location: '公园', replyDelay: 0, tags: [], description: '', edited: 1, specialMomentStatus: 'pending' },
-  );
-  db.prepare('UPDATE daily_schedules SET schedule_json = ? WHERE character_id = ?')
-    .run(JSON.stringify(schedule), charId);
+    const generated = [];
+    special.setSpecialScheduleMomentGenerator(async item => {
+      generated.push(item);
+      editor.updateSpecialMomentStatus(item.characterId, item.activity.startTime, 'sent');
+    });
+    await special.runSpecialMomentCheck();
 
-  const generated = [];
-  special.setSpecialScheduleMomentGenerator(async item => {
-    generated.push(item);
-    editor.updateSpecialMomentStatus(item.characterId, item.activity.startTime, 'sent');
+    assert.equal(generated.length, 1);
+    assert.equal(generated[0].activity.activity, '时段内约定');
+    assert.equal(generated[0].characterId, charId);
+
+    const after = loadSchedule(db, charId);
+    const inWin = after.find(a => a.activity === '时段内约定');
+    const expired = after.find(a => a.activity === '已过时约定');
+    assert.equal(inWin.specialMomentStatus, 'sent');
+    assert.equal(expired.specialMomentStatus, 'expired', '过时不候：启动/扫描时已过时段直接标记 expired');
+
+    // 重复扫描不会再次发送
+    await special.runSpecialMomentCheck();
+    assert.equal(generated.length, 1);
   });
-  await special.runSpecialMomentCheck();
-
-  assert.equal(generated.length, 1);
-  assert.equal(generated[0].activity.activity, '时段内约定');
-  assert.equal(generated[0].characterId, charId);
-
-  const after = loadSchedule(db, charId);
-  const inWin = after.find(a => a.activity === '时段内约定');
-  const expired = after.find(a => a.activity === '已过时约定');
-  assert.equal(inWin.specialMomentStatus, 'sent');
-  assert.equal(expired.specialMomentStatus, 'expired', '过时不候：启动/扫描时已过时段直接标记 expired');
-
-  // 重复扫描不会再次发送
-  await special.runSpecialMomentCheck();
-  assert.equal(generated.length, 1);
 });
 
 test('pending schedule changes: today applies, tomorrow waits, past expires, wiped snapshot re-applies', async t => {
@@ -357,23 +373,23 @@ test('pending schedule changes: today applies, tomorrow waits, past expires, wip
 test('failed special moment generation falls back to pending for retry', async t => {
   const db = getDb();
   t.after(() => closeDb());
-  const charId = insertCharWithSchedule(db, '重试测试', BASE_DAY);
-  const [inWinStart, inWinEnd] = inWindowSlot(40);
+  await withFixedClock(todayAt(12), async () => {
+    const charId = insertCharWithSchedule(db, '重试测试', BASE_DAY);
+    const schedule = loadSchedule(db, charId);
+    schedule.push(
+      { startTime: '11:50', endTime: '12:30', activity: '会失败的约定', location: '公园', replyDelay: 0, tags: [], description: '', edited: 1, specialMomentStatus: 'pending' },
+    );
+    db.prepare('UPDATE daily_schedules SET schedule_json = ? WHERE character_id = ?')
+      .run(JSON.stringify(schedule), charId);
 
-  const schedule = loadSchedule(db, charId);
-  schedule.push(
-    { startTime: inWinStart, endTime: inWinEnd, activity: '会失败的约定', location: '公园', replyDelay: 0, tags: [], description: '', edited: 1, specialMomentStatus: 'pending' },
-  );
-  db.prepare('UPDATE daily_schedules SET schedule_json = ? WHERE character_id = ?')
-    .run(JSON.stringify(schedule), charId);
-
-  let attempts = 0;
-  special.setSpecialScheduleMomentGenerator(async () => {
-    attempts++;
-    throw new Error('LLM down');
+    let attempts = 0;
+    special.setSpecialScheduleMomentGenerator(async () => {
+      attempts++;
+      throw new Error('LLM down');
+    });
+    await special.runSpecialMomentCheck();
+    assert.equal(attempts, 1);
+    const after = loadSchedule(db, charId);
+    assert.equal(after.find(a => a.activity === '会失败的约定').specialMomentStatus, 'pending', '失败回退 pending，窗口内下轮重试');
   });
-  await special.runSpecialMomentCheck();
-  assert.equal(attempts, 1);
-  const after = loadSchedule(db, charId);
-  assert.equal(after.find(a => a.activity === '会失败的约定').specialMomentStatus, 'pending', '失败回退 pending，窗口内下轮重试');
 });

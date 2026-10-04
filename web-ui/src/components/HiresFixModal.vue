@@ -22,14 +22,26 @@
             </div>
             <p v-else key="basic" class="hires-hint">基础版使用下方步数、CFG 和重绘幅度；进阶采样及超分设置会保留，切回进阶版可继续使用。</p>
             </Transition>
+            <div class="hires-turbo-row">
+              <div class="hires-turbo-copy">
+                <div class="hires-turbo-title">细化用 turbo 参数（更快）</div>
+                <div class="hires-turbo-desc">打开：CFG 1.0，步数按设置页「细化精度」档位（高 12 / 中 10 / 低 8），速度约快一倍、更贴合 turbo 模型；关闭：按下方步数与 CFG 细化</div>
+              </div>
+              <linshe-switch v-model="turbo" size="sm" on-text="已启用" off-text="已关闭" aria-label="细化用 turbo 参数" />
+            </div>
             <linshe-tabs v-if="advanced" v-model="samplingMode" :options="samplingModeOptions" size="sm" aria-label="采样参数来源" />
             <div aria-live="polite">
             <Transition name="hires-mode" mode="out-in">
               <div :key="samplingPanelMode" class="hires-sampling-panel">
                 <template v-if="followSource">
                   <div class="hires-section-title">采样参数自动跟随原图</div>
-                  <p class="hires-hint">步数、CFG、采样器和调度器在细化时从对应的源工作流读取；不同原图可能使用不同参数。下方的重绘幅度和最长边仍由你设置。</p>
-                  <p class="hires-hint">备用参数：{{ steps }} 步 · CFG {{ cfg }}。仅在源采样参数缺失或无法唯一确定时使用，不代表原图的实际参数。</p>
+                  <!-- 2026-10-01（并入上游 v3.6.2 进阶版时的口径裁决）：本仓的「细化用 turbo 参数」默认开着，
+                       此时步数 / CFG **不**跟随原图（只跟随采样器与调度器）。这段文案必须按 turbo 分支写，
+                       否则它会和下面那句 turbo 提示（「上面的步数与 CFG 暂不生效」）在同一屏里互相打脸。 -->
+                  <p v-if="turbo" class="hires-hint">采样器与调度器在细化时从对应的源工作流读取；不同原图可能使用不同参数。<strong>步数与 CFG 由上面的「turbo 参数」接管，不跟随原图。</strong>下方的重绘幅度和最长边仍由你设置。</p>
+                  <p v-else class="hires-hint">步数、CFG、采样器和调度器在细化时从对应的源工作流读取；不同原图可能使用不同参数。下方的重绘幅度和最长边仍由你设置。</p>
+                  <p v-if="turbo" class="hires-hint">你填的 {{ steps }} 步 · CFG {{ cfg }} 会在<strong>关掉 turbo</strong> 后才参与跟随判定（源参数取不到时用它兜底）。</p>
+                  <p v-else class="hires-hint">备用参数：{{ steps }} 步 · CFG {{ cfg }}。仅在源采样参数缺失或无法唯一确定时使用，不代表原图的实际参数。</p>
                   <linshe-button variant="link" size="sm" :aria-expanded="showSamplingFallback" @click="showSamplingFallback = !showSamplingFallback">{{ showSamplingFallback ? '收起备用参数' : '调整备用参数' }}</linshe-button>
                 </template>
                 <template v-else>
@@ -69,6 +81,7 @@
                 <linshe-input id="hires-source-blend" v-model.number="sourceBlend" type="number" min="0" max="1" step="0.05" />
               </div>
             </div>
+            <p class="hires-turbo-notice">{{ turbo ? '当前由「turbo 参数」接管：细化固定 CFG 1.0，步数按设置页「细化精度」档位（高 12 / 中 10 / 低 8）；上面的步数与 CFG 仍可编辑，但暂不生效。' : '当前按上面的步数与 CFG 细化。' }}</p>
           </div>
 
           <div class="hires-section hires-artist-section">
@@ -195,6 +208,8 @@ const props = defineProps({
   initialMaxSize: { type: Number, default: 2000 },
   initialArtistMode: { type: String, default: 'empty' },
   initialArtist: { type: String, default: '' },
+  /** 细化是否按 turbo 参数走（默认 true，与后端默认一致）；与其它字段一样走本弹窗的「保存」 */
+  initialTurbo: { type: Boolean, default: true },
 })
 
 const emit = defineEmits(['update:modelValue', 'saved'])
@@ -225,6 +240,7 @@ const artistModeOptions = [
   { value: 'specified', label: '指定' },
 ]
 const artist = ref('')
+const turbo = ref(true)
 const artistModeHint = computed(() => {
   if (artistMode.value === 'empty') return 'HiresFix 时不使用画师串'
   if (artistMode.value === 'specified') return '使用下方自定义的画师串，可覆盖原图画师串'
@@ -256,6 +272,7 @@ watch(() => props.modelValue, (v) => {
     maxSize.value = Number.isFinite(props.initialMaxSize) ? props.initialMaxSize : 2000
     artistMode.value = ['inherit', 'empty', 'specified'].includes(props.initialArtistMode) ? props.initialArtistMode : 'empty'
     artist.value = props.initialArtist || ''
+    turbo.value = props.initialTurbo !== false
     fetchLorasFiles()
   }
 })
@@ -344,8 +361,8 @@ async function save() {
   const savedArtist = (artist.value || '').trim()
   loraLoading.value = true
   try {
-    await api.updateHiresSettings({ ...extraSettings, loras: validLoras, steps: savedSteps, cfg: savedCfg, denoise: savedDenoise, maxSize: savedMaxSize, artistMode: savedArtistMode, artist: savedArtist })
-    emit('saved', { ...extraSettings, loras: validLoras, steps: savedSteps, cfg: savedCfg, denoise: savedDenoise, maxSize: savedMaxSize, artistMode: savedArtistMode, artist: savedArtist })
+    await api.updateHiresSettings({ ...extraSettings, loras: validLoras, steps: savedSteps, cfg: savedCfg, denoise: savedDenoise, maxSize: savedMaxSize, artistMode: savedArtistMode, artist: savedArtist, turboMode: turbo.value })
+    emit('saved', { ...extraSettings, loras: validLoras, steps: savedSteps, cfg: savedCfg, denoise: savedDenoise, maxSize: savedMaxSize, artistMode: savedArtistMode, artist: savedArtist, turbo: turbo.value })
     emit('update:modelValue', false)
     if (toastFn) toastFn('HiresFix 设置已保存', 'success')
   } catch (e) {
@@ -376,6 +393,19 @@ async function save() {
   border: 1px solid var(--tint-subtle);
   border-radius: 10px;
   padding: 12px 14px 14px;
+}
+.hires-turbo-row {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  margin-bottom: 12px; padding-bottom: 12px;
+  border-bottom: 1px dashed var(--tint-subtle);
+}
+.hires-turbo-copy { flex: 1; min-width: 0; }
+.hires-turbo-title { font-size: 13px; font-weight: 700; color: var(--text-bright); }
+.hires-turbo-desc { margin-top: 3px; font-size: 11px; color: var(--text-secondary); line-height: 1.5; }
+.hires-turbo-row .ls-switch { margin-top: 2px; }
+.hires-turbo-notice {
+  margin: 10px 0 0; font-size: 11px; line-height: 1.5;
+  color: var(--text-secondary);
 }
 .hires-params { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
 .hires-params .form-group { margin-bottom: 0; }

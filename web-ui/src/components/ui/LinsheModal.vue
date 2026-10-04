@@ -1,7 +1,8 @@
 <template>
-  <Teleport to="body">
-    <Transition name="modal-fade">
-      <div v-if="isOpen" class="modal-overlay linshe-modal-overlay" @click.self="close">
+  <Teleport :to="anchor || 'body'" defer>
+    <!-- 首次直达页面时，anchor 宿主与弹窗同批挂载；等宿主插入后再解析目标。 -->
+    <Transition name="modal-fade" :duration="transitionMs">
+      <div v-if="isOpen" class="modal-overlay linshe-modal-overlay" :class="{ 'is-host-anchored': isAnchored }" :style="transitionMs ? {'--linshe-modal-duration':`${transitionMs}ms`} : undefined" @click.self="close">
         <div class="modal-panel linshe-modal" :class="[{ 'modal-wide': wide, 'modal-full': full }, panelClass]" @click.stop>
           <div class="modal-header">
             <h3 class="modal-title">{{ title }}</h3>
@@ -28,7 +29,7 @@
 // 视觉走全局 modal 家族类 + 本组件的白色内衬（--modal-lining-*）。
 // 暖色沿用 v3.2 人物详情卡口径（暖纸外壳 + 白色内衬），暗夜保持 Cel Glow 深色玻璃。
 // 内容用 #default 插槽；需要自定义底部操作区时用 #footer；头部右侧附加内容用 #header-extra。
-import { computed, watch } from 'vue'
+import { computed, watch, onBeforeUnmount } from 'vue'
 
 import LinsheButton from './LinsheButton.vue'
 
@@ -37,14 +38,23 @@ const props = defineProps({
   /** 旧用法仍可传 visible；新用法优先 v-model */
   visible: { type: Boolean, default: false },
   title: { type: String, default: '' },
+  transitionMs: { type: Number, default: undefined },
   wide: { type: Boolean, default: false },   // 面板加宽（.modal-wide）
   full: { type: Boolean, default: false },   // 大型管理面板（.modal-full）
   panelClass: { type: [String, Array, Object], default: '' },
   bodyClass: { type: [String, Array, Object], default: '' },
+  /**
+   * 宿主选择器（如 '.page-modal-host'）：遮罩 Teleport 进该元素并铺满它，面板相对宿主居中，
+   * 而不是相对整个视口居中（页面两侧有导航 / 侧栏时，视口居中的面板看着是偏的）。
+   * 宿主需要是定位元素（position 非 static），并与路由内容隔开，避免卸载时移除路由插入锚点。
+   * 留空＝旧口径：Teleport 到 body、相对视口居中。
+   */
+  anchor: { type: String, default: '' },
 })
 
 const emit = defineEmits(['update:modelValue', 'close'])
 const isOpen = computed(() => props.modelValue || props.visible)
+const isAnchored = computed(() => !!props.anchor)
 
 function close() {
   emit('update:modelValue', false)
@@ -59,9 +69,13 @@ watch(isOpen, (v) => {
   if (v) window.addEventListener('keydown', onKeydown)
   else window.removeEventListener('keydown', onKeydown)
 }, { immediate: true })
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
 <style scoped>
+.modal-fade-enter-active { transition-duration:var(--linshe-modal-duration,250ms); }
+.modal-fade-leave-active { transition-duration:var(--linshe-modal-duration,180ms); }
+.modal-fade-enter-active .modal-panel { animation-duration:var(--linshe-modal-duration,340ms); }
 .modal-header-extra {
   display: inline-flex;
   align-items: center;
@@ -98,6 +112,12 @@ watch(isOpen, (v) => {
 .linshe-modal .modal-body::-webkit-scrollbar-thumb:hover {
   background: rgba(var(--accent-rgb), 0.45);
 }
+
+/* 宿主居中模式（传了 anchor）：遮罩被 Teleport 进宿主元素，fixed 改 absolute 铺满宿主，
+   面板因此相对宿主左右居中，而不是相对视口居中。 */
+.linshe-modal-overlay.is-host-anchored { position: absolute; }
+/* 面板宽度上限改按宿主宽度算：基座的 94vw/96vw 是视口口径，宿主被侧栏占去一块后会顶出边界 */
+.linshe-modal-overlay.is-host-anchored .modal-panel { max-width: 100%; }
 
 /* 移动端：保留 PC 的「圆角浮层」观感 —— 面板圆角、描边、白色内衬一律不动，
    只把遮罩留白从 20px 收紧到 8px，并把刘海 / 挖孔 / 手势条的安全区让给遮罩

@@ -60,7 +60,7 @@ test('POST /api/groups/:id/avatar 落盘并写库；空 base64 清空头像且�
   const saved = await callPost(groupId, { base64: PNG_BASE64 });
   assert.equal(saved.status, 200);
   assert.equal(saved.payload.ok, true);
-  assert.match(saved.payload.avatar_path, /^\/avatars\/group_\d+_\d+\.png$/);
+  assert.match(saved.payload.avatar_path, /^\/avatars\/group_\d+_\d+_[0-9a-f]{6}\.png$/);
   const file = avatarFileOf(saved.payload.avatar_path);
   assert.ok(fs.existsSync(file), '头像文件应写入 data/avatars');
   assert.equal(storedAvatarPath(groupId), saved.payload.avatar_path);
@@ -78,7 +78,8 @@ test('POST /api/groups/:id/avatar 换头像时清理旧文件', async t => {
 
   const first = await callPost(groupId, { base64: PNG_BASE64 });
   const second = await callPost(groupId, { base64: PNG_BASE64 });
-  // /avatars 静态缓存 30 天，文件名不带时间戳就会一直显示旧头像
+  // /avatars 静态缓存 30 天，文件名不带时间戳就会一直显示旧头像；
+  // 唯一性由「时间戳 + 3 字节随机后缀」共同保证——只靠毫秒会撞名，而撞名时路由的删旧逻辑会删掉刚写的新文件。
   assert.notEqual(first.payload.avatar_path, second.payload.avatar_path);
   assert.equal(fs.existsSync(avatarFileOf(first.payload.avatar_path)), false, '旧头像文件应被删除');
   assert.ok(fs.existsSync(avatarFileOf(second.payload.avatar_path)));
@@ -105,7 +106,7 @@ test('群列表序列化带 avatar_path（未设置时为 null）', async t => {
 
   await callPost(groupId, { base64: PNG_BASE64 });
   const after = await callGetList();
-  assert.match(after.groups[0].avatar_path, /^\/avatars\/group_\d+_\d+\.png$/);
+  assert.match(after.groups[0].avatar_path, /^\/avatars\/group_\d+_\d+_[0-9a-f]{6}\.png$/);
 
   await callPost(groupId, { base64: '' });
 });

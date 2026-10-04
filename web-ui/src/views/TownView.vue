@@ -21,10 +21,45 @@
       @pointerup="onCanvasUp"
       @pointercancel="onCanvasCancel"
       @pointerleave="onCanvasLeave"
+      @lostpointercapture="onCarryCaptureLost"
       @wheel.prevent="onWheel"
       @dblclick="onDblClick"
     ></canvas>
+    <Transition name="carry-fade">
+      <div v-if="carryState || carryNotice" class="town-carry-hint" role="status" aria-live="polite">
+        {{ carryNotice || (carryState.phase === 'starting' ? '轻轻拎起…' : carryState.phase === 'dropping' ? '正在放下…' : '拖到空地松手放下 · Esc 放回原处') }}
+      </div>
+    </Transition>
 
+    <!-- 居民动态浮窗（左上角）：最新一条 NPC 活动记录，0.3s 渐入渐出；点开看全镇流水 -->
+    <Transition name="ticker-fade" mode="out-in">
+      <div
+v-if="latestActivity && initialized" :key="latestActivity.seq" class="town-activity-ticker" role="button" tabindex="0"
+        :aria-label="`居民动态：${latestActivity.name}${latestActivity.text}，点开查看全部`"
+        @click="activityPanelOpen = true" @keydown.enter="activityPanelOpen = true"
+>
+        <span class="tat-name">{{ latestActivity.name }}</span>
+        <span class="tat-text">{{ latestActivity.text }}</span>
+      </div>
+    </Transition>
+    <!-- anchor：窗口相对小镇页面居中；挂到独立弹窗层，不与路由页面共用 Teleport 容器。 -->
+    <LinsheModal v-model="activityPanelOpen" title="居民动态" anchor=".page-modal-host">
+      <div class="town-activity-panel">
+        <div class="tap-toolbar">
+          <span class="tap-hint">最近 40 条全镇行动记录</span>
+          <linshe-button variant="link" size="sm" :disabled="activityFeedLoading" @click="refreshActivityFeed">{{ activityFeedLoading ? '刷新中…' : '刷新' }}</linshe-button>
+        </div>
+        <p v-if="!activityFeed.length && !activityFeedLoading" class="tap-empty">还没什么动静，居民们大概在忙自己的事。</p>
+        <ul v-else class="tap-list">
+          <li v-for="item in activityFeed" :key="item.seq">
+            <time>{{ formatActivityTime(item.occurredAt) }}</time>
+            <span class="tap-name">{{ item.name }}</span>
+            <span class="tap-text">{{ item.text }}</span>
+            <span v-if="item.reason" class="tap-reason">{{ item.reason }}</span>
+          </li>
+        </ul>
+      </div>
+    </LinsheModal>
     <!-- 顶栏 -->
     <div class="town-topbar">
       <div class="town-title-row">
@@ -35,6 +70,7 @@
         <span v-if="weatherText" class="town-chip">{{ weatherIcon }} {{ weatherText }}</span>
         <span v-if="weather?.timeDesc" class="town-chip">{{ weather.timeDesc }}</span>
         <span class="town-chip">{{ agents.length }} 位居民</span>
+        <span v-if="initialized" class="town-chip">长按居民可拎起</span>
         <span v-if="!connected" class="town-chip is-warn">连接中…</span>
       </div>
       <div v-if="initialized" class="town-topbar-actions">
@@ -182,6 +218,8 @@ v-if="!hdActive" variant="ghost" size="sm"
 v-if="chatCharacterId != null" :key="`char:${chatCharacterId}`"
           :character-id="chatCharacterId" :town-context="dialogueContext" @context-invalid="refreshDialogueWorld" :display-name="chatResident?.displayName"
           :standing-url="chatResident?.standingUrl" :avatar-url="chatResident?.avatarPath"
+          :status-line="dialogueStatusLine"
+          @open-status="openResidentStatus" @open-activity="openResidentActivity"
           :player-name="player?.displayName || '我'" @close="closeDialogue"
           @story="openResidentStory"
 />
@@ -191,12 +229,18 @@ v-else-if="chatNpcId != null"
           :npc-id="chatNpcId" :world-id="dialogueContext?.worldId" :world-epoch="dialogueContext?.worldEpoch"
           :player-name="player?.displayName || '我'"
           :display-name="chatNpcName"
+          :status-line="dialogueStatusLine"
+          @open-status="openResidentStatus" @open-activity="openResidentActivity"
           @close="closeDialogue" @story="openResidentStory"
           @character-chat="openLinkedCharacterChat" @context-invalid="refreshDialogueWorld"
         />
       </div>
     </Transition>
     <p v-if="dialogueOpening || dialogueError || lifeMoveError || travelNotice" class="town-dialogue-notice" role="status">{{ travelNotice || lifeMoveError || dialogueError || '正在停下脚步…' }}</p>
+    <TownResidentStatusModal v-model="residentStatusOpen" :name="chatResident?.displayName || chatNpcName"
+      :status="residentStatus.data" :loading="residentStatus.loading" @refresh="fetchResidentStatus" />
+    <TownResidentActivityModal v-model="residentActivityOpen" :name="chatResident?.displayName || chatNpcName"
+      :activity="residentActivityMerged" :loading="residentActivity.loading" />
     <TownWalletPanel :open="showWalletPanel" @close="closeWalletPanel" />
     <TownPaperPanel v-if="spotReady && worldSpot" :open="true" :title="worldSpot.displayName" @close="closeWorldSpot">
       <p>选择这里的功能。服务可展开特殊奇遇，交易可查看商品并买卖。</p>
@@ -308,13 +352,19 @@ import { useTownStore } from '../stores/town.js'
 import { useSettingsStore } from '../stores/settings.js'
 import { playTownBgm, pauseTownBgm, setTownBgmMuted } from '../utils/townBgm.js'
 import { formatTownTemperature } from '../utils/townWeather.js'
+import { getProgramTime } from '../api/timeControl.js'
+import { programTimeViewModel } from '../components/timeControlLogic.js'
 import * as api from '../api/index.js'
 import LinsheButton from '../components/ui/LinsheButton.vue'
+import LinsheModal from '../components/ui/LinsheModal.vue'
 import LinsheSwitch from '../components/ui/LinsheSwitch.vue'
 import { createCanvasTownRenderer } from '../town/renderers/CanvasTownRenderer.js'
 import { HW, HH, cellTopWorld, cellCenterWorld, worldToCell, objectRect, buildBlockedCells } from '../town/renderers/projection.js'
 import { canvasGroundImage } from '../town/renderers/groundTexture.js'
 import { adaptAgent, assetUrl } from '../town/renderers/TownSceneAdapter.js'
+import { mergeActivityWithTrail } from '../town/wanderTrail.js'
+import { createResidentCarry } from '../town/residentCarry.js'
+import { carryGroundPoint, drawResidentCarry } from '../town/residentCarryOverlay.js'
 import LinsheInput from '../components/ui/LinsheInput.vue'
 import LinsheSelect from '../components/ui/LinsheSelect.vue'
 import { TOWN_FOOTPRINT_OPTIONS, parseTownFootprint } from '../utils/townFootprint.js'
@@ -325,6 +375,8 @@ import TownCharacterChat from '../components/town/TownCharacterChat.vue'
 import TownWalletPanel from '../components/town/TownWalletPanel.vue'
 import TownPaperPanel from '../components/town/TownPaperPanel.vue'
 import TownResidentActions from '../components/town/TownResidentActions.vue'
+import TownResidentStatusModal from '../components/town/TownResidentStatusModal.vue'
+import TownResidentActivityModal from '../components/town/TownResidentActivityModal.vue'
 import TownCapabilityPicker from '../components/town/TownCapabilityPicker.vue'
 import TownAdminPanel from '../components/town/TownAdminPanel.vue'
 import TownServiceManagerHost from '../components/town/TownServiceManagerHost.vue'
@@ -333,7 +385,7 @@ import TownTravelOverlay from '../components/town/TownTravelOverlay.vue'
 
 const router = useRouter(), route = useRoute()
 const town = useTownStore()
-const { map: mapMeta, locations, agents, player, weather, loaded, connected, initialized, renderMap } = storeToRefs(town)
+const { map: mapMeta, locations, agents, player, weather, loaded, connected, initialized, renderMap, lifeVenues } = storeToRefs(town)
 
 // ── BGM：进入世界页续播、离开暂停（断点存内存），静音状态同步 system_settings ──
 const settingsStore = useSettingsStore()
@@ -475,6 +527,92 @@ const chatResident = ref(null)
 const dialogueContext = ref(null)
 const dialogueOpening = ref(false)
 const dialogueError = ref('')
+
+// ── 居民动态：对话框头部的「状态 / 动态」独立弹窗，世界页左上角信息流 ──
+// 当前状态直接取地图快照里的 activityText（服务端权威、随快照刷新）
+const dialogueStatusLine = computed(() => {
+  const resident = chatResident.value
+  if (!resident) return ''
+  const live = town.agents.find(a => a.agentKey === resident.agentKey)
+  return live?.activityText || resident.activityText || '在镇上生活'
+})
+// 对话框「动态」弹窗：单个居民最近 100 条行动记录（按 actorId 缓存，换人即作废）
+const residentActivity = ref({ actorId: '', entries: [], loading: false, loaded: false })
+async function fetchResidentActivity() {
+  const actorId = chatResident.value?.actorId
+  if (!actorId) return
+  const previous = residentActivity.value
+  const keepEntries = previous.actorId === actorId ? previous.entries : []
+  residentActivity.value = { actorId, entries: keepEntries, loading: true, loaded: previous.actorId === actorId && previous.loaded }
+  try {
+    const data = await api.fetchTownActorActivity(actorId, 100)
+    if (chatResident.value?.actorId === actorId) {
+      residentActivity.value = { actorId, entries: data?.entries || [], loading: false, loaded: true }
+    }
+  } catch {
+    if (chatResident.value?.actorId === actorId) {
+      residentActivity.value = { actorId, entries: keepEntries, loading: false, loaded: false }
+    }
+  }
+}
+// 居民状态 / 动态弹窗（独立窗口，不挤占对话框）：需求、心情、目标、技能、最近来往 / 行动记录
+// 两个窗口互斥：头部按钮点第二个时先把前一个收掉，避免叠两层遮罩
+const residentStatus = ref({ actorId: '', data: null, loading: false, loaded: false })
+const residentStatusOpen = ref(false)
+const residentActivityOpen = ref(false)
+function openResidentStatus() {
+  if (!chatResident.value?.actorId) return
+  residentActivityOpen.value = false
+  residentStatusOpen.value = true
+  if (!residentStatus.value.loaded || residentStatus.value.actorId !== chatResident.value.actorId) fetchResidentStatus()
+}
+function openResidentActivity() {
+  if (!chatResident.value?.actorId) return
+  residentStatusOpen.value = false
+  residentActivityOpen.value = true
+  // 打开对话时已预取过一次；失败或还没返回时这里再要一次
+  if (!residentActivity.value.loaded && !residentActivity.value.loading) fetchResidentActivity()
+}
+async function fetchResidentStatus() {
+  const actorId = chatResident.value?.actorId
+  if (!actorId) return
+  const previous = residentStatus.value
+  const keep = previous.actorId === actorId ? previous.data : null
+  residentStatus.value = { actorId, data: keep, loading: true, loaded: previous.actorId === actorId && previous.loaded }
+  try {
+    const data = await api.fetchTownActorStatus(actorId)
+    if (chatResident.value?.actorId === actorId) residentStatus.value = { actorId, data, loading: false, loaded: true }
+  } catch {
+    if (chatResident.value?.actorId === actorId) residentStatus.value = { actorId, data: keep, loading: false, loaded: false }
+  }
+}
+// 「动态」弹窗 = 后端行动记录 + 前端合成足迹（足迹只在内存，不进存档；见 wanderTrail.js）
+const residentActivityMerged = computed(() => mergeActivityWithTrail(
+  residentActivity.value.entries,
+  town.wanderTrails?.[chatResident.value?.actorId] || [],
+))
+// 左上角浮窗与面板共用一份全镇信息流（60s 节奏，和快照刷新同频）
+const activityFeed = ref([])
+const activityFeedLoading = ref(false)
+const activityPanelOpen = ref(false)
+const latestActivity = computed(() => activityFeed.value[0] || null)
+async function refreshActivityFeed() {
+  if (activityFeedLoading.value) return
+  activityFeedLoading.value = true
+  try {
+    const data = await api.fetchTownActivity(40)
+    activityFeed.value = data?.entries || []
+  } catch { /* 信息流拉取失败不打扰地图 */ }
+  finally { activityFeedLoading.value = false }
+}
+const refreshActivityTimer = setInterval(() => { if (!disposed) refreshActivityFeed() }, 60_000)
+function formatActivityTime(occurredAt) {
+  const date = new Date(occurredAt)
+  if (!Number.isFinite(date.getTime())) return ''
+  const now = new Date()
+  const hhmm = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  return date.toDateString() === now.toDateString() ? hhmm : `${date.getMonth() + 1}月${date.getDate()}日 ${hhmm}`
+}
 const showWalletPanel = ref(false)
 // 世界里点开的建筑互动面板：{ displayName, locationKey }
 const worldSpot = ref(null)
@@ -518,10 +656,24 @@ const spotReady = computed(() => !!worldSpot.value && !!worldScope.value.worldId
 const showAdmin = ref(false)
 const showWizard = ref(false)
 const dragging = ref(false)
+const carryState = ref(null)
+const carryNotice = ref('')
+let carryNoticeTimer = null
+let carryTheme = null
+let carryColors = {}
+function refreshCarryColors() {
+  const theme = document.documentElement.getAttribute('data-theme') || 'warm'
+  if (carryTheme === theme) return
+  carryTheme = theme
+  const style = getComputedStyle(document.documentElement)
+  const color = name => style.getPropertyValue(name).trim()
+  carryColors = { accent: color('--accent'), danger: color('--fun-orange'),
+    paper: color('--bg-secondary'), ink: color('--text-primary') }
+}
 
 // 顶栏动作的统一禁用口径：编辑中 / 管理面板 / 开镇向导 / 画布被对话、建筑面板或过场占住。
 // 顶栏按钮不再各写一份 `editing || showAdmin || showWizard || dialogueInputBlocked`。
-const uiLocked = computed(() => editing.value || showAdmin.value || showWizard.value || dialogueInputBlocked.value)
+const uiLocked = computed(() => editing.value || showAdmin.value || showWizard.value || dialogueInputBlocked.value || !!carryState.value)
 const travelTarget = computed(() => town.maps.find(m => m.id === travelTargetId.value) || null)
 const travelReadyCount = computed(() => town.maps.filter(m => m.status === 'ready').length)
 const travelCanDepart = computed(() => !!travelTarget.value && travelTarget.value.status === 'ready'
@@ -540,6 +692,7 @@ let moveTimer = null
 watch(dialogueInputBlocked, blocked => {
   if (!blocked) return
   clearMovementKeys()
+  cancelCarry()
   onCanvasLeave()
 }, { flush: 'sync' })
 watch(() => [town.snapshot?.worldId, town.snapshot?.worldEpoch], () => {
@@ -607,6 +760,7 @@ const canvasClass = computed(() => ({
   'is-editing': editing.value,
   'is-panning': dragging.value,
   'is-traveling': traveling.value,
+  'is-carrying': !!carryState.value,
 }))
 
 const mapDisplayName = computed(() => renderMap.value?.name || mapMeta.value?.name || '邻舍小镇')
@@ -781,10 +935,73 @@ function enterWorldSpot(spot) {
 let downInfo = null
 let suppressClick = false
 
+function carryMessage(text) {
+  clearTimeout(carryNoticeTimer)
+  carryNotice.value = text
+  carryNoticeTimer = setTimeout(() => { carryNotice.value = '' }, 3200)
+}
+function carryProject(pos) {
+  return hdRenderer?.project({ x: pos.x + .5, y: 0, z: pos.y + .5 }) || { x: 0, y: 0 }
+}
+function carryDropCell(point) {
+  const g = carryState.value
+  const p = carryGroundPoint({ ...g, point })
+  const cell = screenToCell(p.x, p.y)
+  if (!inBounds(cell) || blockedCells.has(`${cell.x},${cell.y}`)) return null
+  const occupied = [...agents.value, ...(player.value ? [player.value] : [])].some(a => {
+    if (a.actorId === g?.agent.actorId) return false
+    const pos = agentDisplayPos(a)
+    return Math.round(pos.x) === cell.x && Math.round(pos.y) === cell.y
+  })
+  return occupied ? null : cell
+}
+const residentCarry = createResidentCarry({
+  request: api.carryTownActor,
+  scope: () => ({ ...worldScope.value, mapId: town.currentMapId }),
+  dropCell: carryDropCell,
+  changed: value => { carryState.value = value },
+  started: g => {
+    clearMovementKeys(); followPlayer = false; dragging.value = false
+    suppressClick = true
+    if (downInfo) downInfo.moved = true
+    const feet = carryProject(agentDisplayPos(g.agent))
+    g.gripOffset = { x: feet.x - g.initial.x, y: feet.y - g.initial.y }
+    g.direction = facing[g.agent.agentKey] || 'down'
+    try { canvasEl.value?.setPointerCapture(g.pointerId) } catch { /* pointer already released */ }
+    carryNotice.value = ''; clearTimeout(carryNoticeTimer)
+  },
+  settled: (result, g) => {
+    if (g.scope.mapId !== town.currentMapId || g.scope.worldId !== worldScope.value.worldId
+      || g.scope.worldEpoch !== worldScope.value.worldEpoch) return
+    const a = agents.value.find(a => a.actorId === g.agent.actorId)
+    if (a && result.position) Object.assign(a, result.position, { path: [], moveStartedAt: 0 })
+    if (result.message) carryMessage(result.message)
+    else if (result.returned) carryMessage('已轻轻放回原处')
+  },
+  error: err => { if (!disposed) { carryMessage(err.message || '没有拎稳，请再试一次'); town.fetchState().catch(() => {}) } },
+})
+const carryPoint = e => ({ x: e.offsetX, y: e.offsetY, pointerId: e.pointerId })
+function cancelCarry() {
+  const pointerId = residentCarry.pointerId
+  residentCarry.abort()
+  try { if (canvasEl.value?.hasPointerCapture(pointerId)) canvasEl.value.releasePointerCapture(pointerId) } catch { /* no capture */ }
+}
+function onCarryCaptureLost() {
+  if (['starting', 'held'].includes(residentCarry.phase)) { cancelCarry(); downInfo = null }
+}
+function onTownBlur() { clearMovementKeys(); onCanvasCancel() }
+watch(() => [town.currentMapId, town.snapshot?.worldId, town.snapshot?.worldEpoch, renderMap.value?.version,
+  editing.value, showAdmin.value, showWizard.value, activityPanelOpen.value], () => cancelCarry())
+
 function onCanvasDown(e) {
-  if (dialogueInputBlocked.value) return
+  if (dialogueInputBlocked.value || showAdmin.value || showWizard.value) return
+  if (downInfo && e.pointerId !== downInfo.pointerId) { onCanvasCancel(); return }
+  if (residentCarry.active) return
   suppressClick = false
-  downInfo = { x: e.offsetX, y: e.offsetY, button: e.button, moved: false }
+  downInfo = { x: e.offsetX, y: e.offsetY, button: e.button, moved: false, pointerId: e.pointerId }
+  if (!editing.value && e.button === 0 && initialized.value && hdRenderer) {
+    residentCarry.down(carryPoint(e), hitAgent(e.offsetX, e.offsetY))
+  }
   if (editing.value && e.button === 0) {
     const cell = screenToCell(e.offsetX, e.offsetY)
     if (['ground', 'road'].includes(editTool.value) && selectedAsset.value && inBounds(cell)) {
@@ -796,6 +1013,8 @@ function onCanvasDown(e) {
 
 function onCanvasMove(e) {
   if (dialogueInputBlocked.value) return
+  if (residentCarry.move(carryPoint(e))) return
+  if (downInfo && e.pointerId !== downInfo.pointerId) return
   if (editing.value) {
     ghostCell.value = screenToCell(e.offsetX, e.offsetY)
     if (paintDrag.value) {
@@ -806,7 +1025,7 @@ function onCanvasMove(e) {
       paintCell(paintDrag.value.lastCell)
     }
   }
-  if (downInfo && !downInfo.moved && (Math.abs(e.offsetX - downInfo.x) > 4 || Math.abs(e.offsetY - downInfo.y) > 4)) {
+  if (downInfo && !downInfo.moved && Math.hypot(e.offsetX - downInfo.x, e.offsetY - downInfo.y) > 8) {
     downInfo.moved = true
     if (!editing.value || downInfo.button !== 0) dragging.value = true
   }
@@ -826,6 +1045,11 @@ function onCanvasMove(e) {
 }
 
 function onCanvasUp(e) {
+  if (residentCarry.up(carryPoint(e))) {
+    suppressClick = true; downInfo = null; dragging.value = false
+    return
+  }
+  if (downInfo && e.pointerId !== downInfo.pointerId) return
   suppressClick = !!downInfo?.moved
   if (editing.value && paintDrag.value && downInfo?.moved) {
     fillRect(paintDrag.value.startCell, paintDrag.value.lastCell)
@@ -843,6 +1067,7 @@ function onCanvasUp(e) {
 // pointercancel（手势被系统接管、来电等）：只收尾，不能算成“移动过”，
 // 否则 suppressClick 会留着把下一次正常点击吃掉。
 function onCanvasCancel() {
+  cancelCarry()
   paintDrag.value = null
   dragging.value = false
   downInfo = null
@@ -852,6 +1077,8 @@ function onCanvasCancel() {
 }
 
 function onCanvasLeave() {
+  if (residentCarry.active) return
+  cancelCarry()
   paintDrag.value = null
   dragging.value = false
   downInfo = null
@@ -860,7 +1087,7 @@ function onCanvasLeave() {
 }
 
 function onCanvasClick(e) {
-  if (dialogueInputBlocked.value) return
+  if (dialogueInputBlocked.value || residentCarry.active) return
   if (suppressClick || downInfo?.moved) { suppressClick = false; return }
   if (!loaded.value) return
   if (editing.value) {
@@ -887,6 +1114,7 @@ function onCanvasClick(e) {
 }
 
 function onCanvasRightClick(e) {
+  if (residentCarry.active) { cancelCarry(); downInfo = null; return }
   if (dialogueInputBlocked.value) return
   if (editing.value && editTool.value === 'block') {
     const cell = screenToCell(e.offsetX, e.offsetY)
@@ -895,12 +1123,12 @@ function onCanvasRightClick(e) {
 }
 
 function onDblClick() {
-  if (dialogueInputBlocked.value) return
+  if (dialogueInputBlocked.value || residentCarry.active) return
   if (!editing.value) followPlayer = true
 }
 
 function onWheel(e) {
-  if (dialogueInputBlocked.value) return
+  if (dialogueInputBlocked.value || residentCarry.active) return
   const factor = e.deltaY < 0 ? 1.12 : 0.89
   const newZoom = Math.min(2.5, Math.max(0.5, cam.zoom * factor))
   const before = screenToWorld(e.offsetX, e.offsetY)
@@ -921,6 +1149,9 @@ const KEY_DIRS = {
 }
 
 function onKeyDown(e) {
+  if (e.code === 'Escape' && residentCarry.active) {
+    e.preventDefault(); cancelCarry(); downInfo = null; suppressClick = true; return
+  }
   if (uiLocked.value) return
   if (e.isComposing || document.activeElement?.closest('input, textarea, [contenteditable="true"], [role="combobox"], [role="listbox"]')) return
   if (KEY_DIRS[e.code]) {
@@ -1400,9 +1631,25 @@ function drawEditorOverlays(c) {
   c.restore()
 }
 
+/**
+ * 天气接口没给 `w.hour` 时的兜底钟点：吃**程序时间**（世界钟），不拿现实钟点冒充。
+ * 2026-10-02 收口（用户：「让角色也感受时间」）：小镇的昼夜滤镜属于世界观感，
+ * 世界钟拨到夜里时地图就该暗下来 —— 原来这里回落到 `new Date().getHours()`（现实钟点）。
+ * 两个来源都拿不到时给 12（中性：三种滤镜都不命中，宁可不上色也不上错色）。
+ */
+const fallbackHour = ref(12)
+
+async function refreshFallbackHour() {
+  try {
+    const view = programTimeViewModel(await getProgramTime())
+    const hh = Number(view.clockText.slice(0, 2))
+    if (view.ok && Number.isFinite(hh)) fallbackHour.value = hh
+  } catch { /* 读不到程序时间：保留上一次的值（初始为中性 12） */ }
+}
+
 function drawWeatherOverlay(c, nowMs) {
   const w = weather.value
-  const hour = w?.hour ?? new Date().getHours()
+  const hour = w?.hour ?? fallbackHour.value
   let tint = null
   if (hour >= 20 || hour < 5) tint = 'rgba(30, 38, 72, 0.32)'
   else if (hour >= 17) tint = 'rgba(244, 160, 92, 0.14)'
@@ -1437,6 +1684,82 @@ function drawWeatherOverlay(c, nowMs) {
   }
 }
 
+// ── 场所状态徽标（T11 §8.1）：座位占用/客满/缺货全部来自服务端 lifeVenues 事实 ──
+// 画布语言与 drawBubble/drawNameTag 同源（暖纸底 + 墨色文字的「质感岛」，不随主题换肤）；
+// 语义状态色不随主题（设计系统约定）。状态切换用 0.3s 渐入，避免生硬跳变。
+const venueBadgeMeta = new Map()   // key -> { status, since }
+const VENUE_STATUS_TEXT = { open: '营业中', full: '客满', stockout: '缺货' }
+const VENUE_STATUS_COLOR = { open: '#3f7d54', full: '#b07d2b', stockout: '#b5484d' }
+
+function venueBadgeStatus(venue) {
+  if (venue.business && venue.offers?.includes('eat')) {
+    if (venue.stockEmpty) return 'stockout'
+    if (Number.isFinite(venue.seatsUsed) && Number.isFinite(venue.seatsTotal)
+      && venue.seatsTotal > 0 && venue.seatsUsed >= venue.seatsTotal) return 'full'
+  }
+  return 'open'
+}
+
+function drawVenueBadges(ctx, nowMs) {
+  if (editing.value || !lifeVenues.value?.length) return
+  const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false
+  const seen = new Set()
+  for (const venue of lifeVenues.value) {
+    if (!venue?.business || !venue.key) continue
+    const loc = (locations.value || []).find(l => l.key === venue.key)
+    if (!loc || !Number.isInteger(loc.x) || !Number.isInteger(loc.y)) continue
+    const status = venueBadgeStatus(venue)
+    seen.add(venue.key)
+    const meta = venueBadgeMeta.get(venue.key)
+    if (!meta || meta.status !== status) venueBadgeMeta.set(venue.key, { status, since: nowMs })
+    const alpha = reducedMotion ? 1 : Math.min(1, (nowMs - venueBadgeMeta.get(venue.key).since) / 300)
+    const center = cellCenterWorld(loc.x, loc.y)
+    const px = center.x
+    const py = center.y - HH * 2.35
+
+    const name = venue.name || venue.key
+    const eats = venue.offers?.includes('eat')
+    const statusText = VENUE_STATUS_TEXT[status]
+    const detail = status === 'open' && eats && Number.isFinite(venue.seatsUsed)
+      ? `座位 ${venue.seatsUsed}/${venue.seatsTotal ?? '?'}`
+      : statusText
+    const label = `${name} · ${detail}`
+    ctx.save()
+    ctx.globalAlpha = alpha
+    ctx.font = '10px "HarmonyOS Sans SC", sans-serif'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    const w = ctx.measureText(label).width + 14
+    const h = 16
+    const bx = px - w / 2
+    const by = py - h / 2
+    // 暖纸胶囊：亮底 + 墨色细描边（与居民名牌同一画布语言）
+    ctx.beginPath()
+    const r = 8
+    ctx.moveTo(bx + r, by)
+    ctx.arcTo(bx + w, by, bx + w, by + h, r)
+    ctx.arcTo(bx + w, by + h, bx, by + h, r)
+    ctx.arcTo(bx, by + h, bx, by, r)
+    ctx.arcTo(bx, by, bx + w, by, r)
+    ctx.closePath()
+    ctx.fillStyle = 'rgba(255,253,248,0.94)'
+    ctx.fill()
+    ctx.strokeStyle = 'rgba(90,70,50,0.55)'
+    ctx.lineWidth = 1
+    ctx.stroke()
+    // 名字墨色，状态词用语义色
+    const namePart = `${name} · `
+    ctx.fillStyle = '#4a3a2c'
+    ctx.fillText(namePart, px - (w - 14) / 2 + ctx.measureText(namePart).width / 2, py + 0.5)
+    ctx.fillStyle = VENUE_STATUS_COLOR[status]
+    ctx.fillText(detail, px + w / 2 - 7 - ctx.measureText(detail).width / 2, py + 0.5)
+    ctx.restore()
+  }
+  for (const key of [...venueBadgeMeta.keys()]) {
+    if (!seen.has(key)) venueBadgeMeta.delete(key)
+  }
+}
+
 function draw(nowMs) {
   rafId = 0
   if (!ctx || disposed) return
@@ -1459,7 +1782,8 @@ function draw(nowMs) {
     cam.x += (center.x - cam.x) * 0.08
     cam.y += (center.y - cam.y) * 0.08
   }
-  const frames = editing.value ? [] : [...agents.value, ...(player.value ? [player.value] : [])].map(a => {
+  const frames = editing.value ? [] : [...agents.value, ...(player.value ? [player.value] : [])]
+    .filter(a => !carryState.value || carryState.value.phase === 'starting' || a.actorId !== carryState.value.agent.actorId).map(a => {
     const pos = agentDisplayPos(a)
     return adaptAgent(a, pos, agentFacing(a, pos), nowMs)
   })
@@ -1481,6 +1805,7 @@ function draw(nowMs) {
     ctx.translate(cssW / 2, cssH / 2); ctx.scale(cam.zoom, cam.zoom); ctx.translate(-cam.x, -cam.y)
     ctx.imageSmoothingEnabled = false
     canvasRenderer.draw(ctx, frames, nowMs, { labelsOnly: true, hover: hoverAgentKey.value })
+    drawVenueBadges(ctx, nowMs)
     if (editing.value) drawEditorOverlays(ctx)
     ctx.restore()
   } else {
@@ -1489,6 +1814,14 @@ function draw(nowMs) {
     ctx.fillText(hdActive.value ? (loaded.value ? '这片土地还在等待它的故事…' : '正在唤醒这个世界…') : 'HD2D 渲染不可用，请点击重试', cssW / 2, cssH / 2)
   }
   drawWeatherOverlay(ctx, nowMs)
+  if (carryState.value && hdRenderer) {
+    refreshCarryColors()
+    drawResidentCarry(ctx, carryState.value, {
+      zoom: cam.zoom, now: Date.now(), reducedMotion: prefersReducedMotion.value,
+      project: carryProject, getImage: getImg, valid: !!carryDropCell(carryState.value.point),
+      colors: carryColors,
+    })
+  }
   if (!document.hidden) rafId = requestAnimationFrame(draw)
 }
 
@@ -1614,7 +1947,7 @@ async function prepareWorldResources() {
 }
 
 function onVisibility() {
-  if (document.hidden) clearMovementKeys()
+  if (document.hidden) onTownBlur()
   if (!document.hidden && rafId === 0) rafId = requestAnimationFrame(draw)
 }
 
@@ -1639,6 +1972,7 @@ watch(townAssets, () => { staticDirty = true }, { deep: true })
 
 onMounted(async () => {
   ctx = canvasEl.value.getContext('2d')
+  refreshActivityFeed()
   if (!settingsStore.bgmMuted) playTownBgm()
   // 出行过场与面板读一次系统的「减少动态」偏好，之后跟着系统变
   if (typeof window.matchMedia === 'function') {
@@ -1654,15 +1988,20 @@ onMounted(async () => {
   document.addEventListener('visibilitychange', onVisibility)
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
-  window.addEventListener('blur', clearMovementKeys)
+  window.addEventListener('blur', onTownBlur)
   rafId = requestAnimationFrame(draw)
   refreshNpcEncounters()
   encounterTimer = window.setInterval(refreshNpcEncounters, 60000)
+  // 昼夜滤镜的兜底钟点跟着世界钟走（60s 一次，够用且不打接口）
+  refreshFallbackHour()
+  fallbackHourTimer = window.setInterval(refreshFallbackHour, 60000)
   await prepareWorldResources()
 })
 
 onBeforeUnmount(() => {
+  cancelCarry(); clearTimeout(carryNoticeTimer)
   disposed = true; rendererEpoch++
+  clearInterval(refreshActivityTimer)
   // 过场中途离开页面：让挂起的等待立刻收尾（异步流程本来就靠 token 作废）
   ++travelRun
   clearTravelNotice()
@@ -1681,13 +2020,16 @@ onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', onVisibility)
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('keyup', onKeyUp)
-  window.removeEventListener('blur', clearMovementKeys)
+  window.removeEventListener('blur', onTownBlur)
   if (moveTimer) { clearInterval(moveTimer); moveTimer = null }
   if (encounterTimer) { clearInterval(encounterTimer); encounterTimer = null }
+  if (fallbackHourTimer) { clearInterval(fallbackHourTimer); fallbackHourTimer = null }
   dialogueRequest++
   stopDialogueHoldTimer()
   releaseDialogueResident(chatResident.value)
   chatResident.value = null
+  residentStatusOpen.value = false
+  residentActivityOpen.value = false
   town.stopTownStream()
 })
 
@@ -1708,6 +2050,11 @@ async function openDialogue(resident) {
     await holdDialogueResident(resident)
     dialogueContext.value = { worldId: town.snapshot?.worldId, worldEpoch: town.snapshot?.worldEpoch, actorId: resident.actorId }
     chatResident.value = resident
+    // 换人即作废上一位的缓存数据，避免新对话框首帧显示成别人的状态/动态
+    residentActivity.value = { actorId: resident.actorId, entries: [], loading: false, loaded: false }
+    residentStatus.value = { actorId: resident.actorId, data: null, loading: false, loaded: false }
+    // 打开对话即预取行动记录：足迹是前端合成的，不能让「动态」页签因为已有足迹而跳过拉取
+    fetchResidentActivity()
     chatCharacterId.value = resident.characterId || null
     chatNpcId.value = resident.characterId ? null : resident.npcId
     chatNpcName.value = resident.displayName || '邻居'
@@ -1753,6 +2100,8 @@ function closeDialogue() {
   dialogueError.value = ''
   dialogueRequest++
   dialogueOpening.value = false
+  residentStatusOpen.value = false
+  residentActivityOpen.value = false
   stopDialogueHoldTimer()
   chatNpcId.value = null
   chatCharacterId.value = null
@@ -1784,6 +2133,8 @@ function closeWalletPanel() {
 // 顶栏奇遇入口：查询当前进行中的镇民奇遇，点击进奇遇页查看和继续。
 const npcEncounterCount = ref(0)
 let encounterTimer = null
+/** 昼夜滤镜兜底钟点的刷新定时器（60s；见 refreshFallbackHour） */
+let fallbackHourTimer = null
 async function refreshNpcEncounters() {
   if (disposed) return
   try {
@@ -2094,10 +2445,76 @@ async function startTravel() {
 }
 
 .town-canvas.is-hoverable { cursor: pointer; }
+.town-canvas.is-carrying { cursor: grabbing; }
+.carry-fade-enter-active, .carry-fade-leave-active { transition: opacity .3s ease; }
+.carry-fade-enter-from, .carry-fade-leave-to { opacity: 0; }
+.town-carry-hint {
+  position: absolute; bottom: 22px; left: 50%; transform: translateX(-50%);
+  max-width: calc(100% - 32px); padding: 9px 16px; z-index: 5;
+  border: 2px solid var(--town-paper-line); border-radius: var(--radius-lg);
+  background: var(--bg-secondary); color: var(--text-primary);
+  box-shadow: var(--shadow-hard-sm); font-size: var(--fs-sm); text-align: center;
+  pointer-events: none;
+}
 .town-canvas.is-editing { cursor: cell; }
 .town-canvas.is-panning { cursor: grabbing; }
 /* 过场期间画布彻底交出去：不接指针、不给悬停光标（输入闸门在 dialogueInputBlocked） */
 .town-canvas.is-traveling { pointer-events: none; cursor: default; }
+
+/* ── 居民动态浮窗（左上角）：与顶栏同款暖纸质感岛，状态更新 0.3s 渐入渐出 ── */
+.town-activity-ticker {
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(46%, 430px);
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(252, 250, 247, 0.92);
+  border: 1px solid rgba(232, 221, 208, 0.8);
+  box-shadow: 0 2px 6px rgba(90, 70, 50, 0.12);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: transform var(--dur-fast, .16s) var(--ease-standard, ease), box-shadow var(--dur-fast, .16s) var(--ease-standard, ease);
+}
+.town-activity-ticker:hover { transform: translateY(-1px); box-shadow: 0 4px 10px rgba(90, 70, 50, 0.16); }
+.town-activity-ticker:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tat-name { flex: none; font-weight: 600; }
+.tat-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .78; }
+.ticker-fade-enter-active, .ticker-fade-leave-active {
+  transition: opacity .3s var(--ease-standard, ease), transform .3s var(--ease-standard, ease);
+}
+.ticker-fade-enter-from { opacity: 0; transform: translateY(-6px); }
+.ticker-fade-leave-to { opacity: 0; transform: translateY(4px); }
+
+/* 动态面板：暖纸列表（复用主题文字色） */
+.town-activity-panel { display: grid; gap: 8px; }
+.tap-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.tap-hint { color: var(--text-secondary, #9a8a78); font-size: 12px; }
+.tap-empty { color: var(--text-secondary, #9a8a78); font-size: 13px; padding: 20px 0; text-align: center; }
+.tap-list {
+  list-style: none; margin: 0; padding: 0;
+  max-height: min(52vh, 420px); overflow-y: auto;
+  display: grid; gap: 6px;
+}
+.tap-list li {
+  display: flex; gap: 10px; align-items: baseline; font-size: 13px;
+  padding: 7px 10px; border-radius: 10px;
+  border: 1px solid rgba(232, 221, 208, 0.8);
+  background: rgba(252, 250, 247, 0.65);
+}
+.tap-list time { flex: none; color: var(--text-secondary, #9a8a78); font-size: 11px; }
+.tap-name { flex: none; font-weight: 600; color: var(--text-primary); }
+.tap-text { color: var(--text-primary); opacity: .85; }
+.tap-reason {
+  flex: none; margin-left: auto; padding: 1px 6px; border-radius: 999px; font-size: 10px;
+  color: #a1846e; border: 1px solid rgba(161, 132, 110, .4); background: rgba(255, 251, 243, .7);
+}
 
 /* ── 进入世界时的资源就绪遮罩 ── */
 .town-boot-mask {
@@ -2217,6 +2634,7 @@ async function startTravel() {
 }
 @container town-world (max-width: 700px) {
   .town-topbar { width: calc(100% - 24px); box-sizing: border-box; gap: 6px; }
+  .town-activity-ticker { top: 84px; max-width: 62%; }
   .town-topbar-actions { width: 100%; flex-wrap: wrap; }
   /* 顶栏在此宽度会折成两行，编辑动作卡下移避让 */
   .town-edit-actions { top: 96px; }

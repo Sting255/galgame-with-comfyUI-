@@ -3,7 +3,10 @@ import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
 import { fileURLToPath } from 'url';
+import { randomBytes } from 'node:crypto';
 import { getDb, getSystemRules, getSystemRulesWithWorld, getWorldSetting, getGlobalRule, getSetting, setSetting, repairFtsIndex } from '../db/index.js';
+// 立绘 ↔ 世界观 一致性（2026-10-01）：生成时记下"这张图是在哪个世界观下生成的"，列表里下发"是否待同步"
+import { currentWorldSignature, withStandingStaleness } from '../services/worldSignature.js';
 import { chatSync } from '../llm/llm-client.js';
 import { config } from '../config.js';
 import { searchCharacterInfo } from '../services/webSearch.js'; // 出站已白名单化（见 webSearch.js assertAllowedOutboundUrl / toSafeMoegirlScrapeUrl）
@@ -86,7 +89,8 @@ router.get('/', (req, res) => {
     return new Date(b.last_message_at) - new Date(a.last_message_at);
   });
 
-  res.json({ characters: enriched });
+  // 立绘是否与"当前世界观"一致（2026-10-01）：前端据此在形象展示上提示 + 一键按当前世界观重生成
+  res.json({ characters: enriched.map(withStandingStaleness) });
 });
 
 // POST /api/characters — 创建角色
@@ -316,7 +320,8 @@ router.post('/:id/avatar', (req, res) => {
   const avatarsDir = path.join(projectRoot, 'data', 'avatars');
   fs.mkdirSync(avatarsDir, { recursive: true });
 
-  const filename = `avatar_${avatarCharId}_${Date.now()}.png`;
+  // 同毫秒两次上传会撞名：写新文件后 unlinkSync(oldPath) 删掉的正是刚写的文件（groups.js 同款 bug 已修）
+  const filename = `avatar_${avatarCharId}_${Date.now()}_${randomBytes(3).toString('hex')}.png`;
   const filePath = path.join(avatarsDir, filename);
   const base64Data = base64.replace(/^data:image\/\w+;base64,/, '');
   fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
@@ -1259,7 +1264,8 @@ function commitStandingImage({ characterId, pendingPath, promptText, promptRefin
   fs.renameSync(pendingPath, destPath);
   const url = buildImageUrl('standing', filename);
 
-  db.prepare('UPDATE characters SET standing_url = ? WHERE id = ?').run(url, characterId);
+  db.prepare('UPDATE characters SET standing_url = ?, standing_world_sig = ? WHERE id = ?')
+    .run(url, currentWorldSignature(), characterId);
 
   console.log(`[generate-standing] Image saved: ${url}`);
 
@@ -1397,7 +1403,9 @@ router.post('/:id/standing-upload', (req, res) => {
     const ext = mimeMatch[1].toLowerCase() === 'jpeg' ? 'jpg' : mimeMatch[1].toLowerCase();
     const filename = `standing_${char.id}_${Date.now()}_upload.${ext}`;
     const url = saveBase64Image('standing', filename, base64);
-    db.prepare('UPDATE characters SET standing_url = ? WHERE id = ?').run(url, char.id);
+    // 用户手动上传的立绘：记当前世界观签名 = "以这张为准"（不该被当成待同步反复提示）
+    db.prepare('UPDATE characters SET standing_url = ?, standing_world_sig = ? WHERE id = ?')
+      .run(url, currentWorldSignature(), char.id);
     invalidateGalleryCache();
     res.json({ ok: true, standing_url: url });
   } catch (err) {

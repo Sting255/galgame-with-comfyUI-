@@ -31,6 +31,12 @@ export function migrateExpressionStandings(db) {
   if (!db.prepare('PRAGMA table_info(expression_standing_jobs)').all().some(c => c.name === 'request_json')) {
     db.exec("ALTER TABLE expression_standing_jobs ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}'");
   }
+  // 2026-10-01（延续主立绘的口径，见 services/worldSignature.js）：
+  // 表情立绘的每个槽位也记下"这张图是在哪个世界观下生成的"（签名 = 世界观 id + 内容哈希）。
+  // 没有它：世界观改了以后，聊天里显示的表情立绘还是旧世界的形象，而系统不知道。
+  if (!db.prepare('PRAGMA table_info(character_expression_standings)').all().some(c => c.name === 'world_sig')) {
+    db.exec('ALTER TABLE character_expression_standings ADD COLUMN world_sig TEXT');
+  }
 }
 
 export function recoverExpressionStandingJobs(db) {

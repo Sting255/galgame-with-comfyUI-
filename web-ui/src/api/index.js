@@ -1,6 +1,8 @@
+import { defaultBackupFileName, parseBackupFileName } from '../utils/dataBackup.js'
+
 const BASE = '/api'
 
-// 统一请求基元：非 2xx 自动抛出服务端 error 信息，成功返回解析后的 JSON
+// 统一请求基元：非 2xx 自动抛出服务端错误信息（4xx 取人话 `message`，5xx 只取机器码 `error`），成功返回解析后的 JSON
 async function request(path, { method = 'GET', body, headers, signal } = {}) {
   const res = await fetch(`${BASE}${path}`, {
     method,
@@ -9,7 +11,15 @@ async function request(path, { method = 'GET', body, headers, signal } = {}) {
     signal,
   })
   const result = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error(result.error || result.message || `请求失败 (${res.status})`)
+  if (!res.ok) {
+    // 2026-10-01 修：**4xx 优先取人话（`message`）**。本仓约定是 `error` = 机器码、`message` = 人话，
+    // 而所有调用点都写成 `toast(err.message)`。具体踩到的坑：玩具门控被拒返回
+    // `403 { error:'toy_gate_blocked', code:'affinity_low', message:'她握住你的手腕，摇头。…' }`，
+    // 原来先取 `error` ⇒ 用户看到的是 `toy_gate_blocked` 这串代码，看着就是「玩具一点就报错」。
+    // 5xx 维持原样（只取 `error`）：errorHandler 的注释写明 5xx 的 err.message 可能含 SQL / 路径细节，不透给界面。
+    const detail = res.status < 500 ? (result.message || result.error) : result.error
+    throw new Error(detail || `请求失败 (${res.status})`)
+  }
   return result
 }
 
@@ -472,12 +482,171 @@ export async function updateGlobalLora(loras) {
 
 /** 更新 HiresFix 细化专用 LoRA（仅作用于放大细化工作流） */
 /** 更新 HiresFix 细化完整设置（LoRA + 步数/重绘幅度/CFG） */
-export function updateHiresSettings({ loras, steps, cfg, denoise, maxSize, artistMode, artist, samplingMode, globalLoraScale, sourceBlend, upscaleModel, workflowMode }) {
-  return request(`/config/hires`, { method: 'PUT', body: { loras, steps, cfg, denoise, maxSize, artistMode, artist, samplingMode, globalLoraScale, sourceBlend, upscaleModel, workflowMode } })
+export function updateHiresSettings({ loras, steps, cfg, denoise, maxSize, artistMode, artist, samplingMode, globalLoraScale, sourceBlend, upscaleModel, workflowMode, turboMode }) {
+  return request(`/config/hires`, { method: 'PUT', body: { loras, steps, cfg, denoise, maxSize, artistMode, artist, samplingMode, globalLoraScale, sourceBlend, upscaleModel, workflowMode, turboMode } })
 }
 
 export async function updateFeatureFlag(key, value) {
   await request(`/config/features`, { method: 'PUT', body: { key, value } })
+}
+
+// ── SLG 动作系统（触摸互动）───────────────────────────────────────────────
+// 契约见 docs/touch-system.md §6.3。
+// 注意：**门控拒绝是 200 + { allowed:false, code, message }**（“她不愿意”是叙事结果，不是服务端错误），
+// 所以走上面的 request() 不会抛；只有非法 action / 角色（400 / 404）或功能关闭（409）才抛。
+
+/** 动作清单 + 服务端算好的逐条门控（gate 就是 getTouchGate 的真实结果，已含催眠豁免 / Lv3 授权） */
+export function fetchTouchActions(characterId, { maxLevel, scene, allowGroupAdult } = {}) {
+  const query = new URLSearchParams()
+  if (maxLevel !== undefined && maxLevel !== null) query.set('maxLevel', String(maxLevel))
+  if (scene) query.set('scene', scene)
+  if (allowGroupAdult) query.set('allowGroupAdult', '1')
+  const suffix = query.toString() ? `?${query.toString()}` : ''
+  return request(`/characters/${characterId}/touch/actions${suffix}`)
+}
+
+/**
+ * 腻烦度 / 偏好状态：{ states: { <key>: { annoyance, tier, likeRatio, updatedAt } }, quota, pendingCount }
+ *
+ * `pendingCount` = 已经做下、但还没被她回应的动作条数（task-25 ③ 的「还有 N 个动作等她回应」）。
+ * task-29：后端把本端点扩成接受 `?scene=chat|group&groupId=<n>`，返回对应口径的 pendingCount；
+ * **不传参数 = 旧行为（私聊口径）**，所以历史调用点零改动。
+ */
+export function fetchTouchState(characterId, { scene, groupId } = {}) {
+  const query = new URLSearchParams()
+  if (scene) query.set('scene', scene)
+  // groupId 用 undefined/null/'' 判空：**0 是合法群 id，不能被假值判断吃掉**
+  if (groupId !== undefined && groupId !== null && groupId !== '') query.set('groupId', String(groupId))
+  const suffix = query.toString() ? `?${query.toString()}` : ''
+  return request(`/characters/${characterId}/touch/state${suffix}`)
+}
+
+/**
+ * 触摸互动统计（阶段三）：次数 / 等级分布 / 最近一次 / 腻烦峰值。
+ * ⚠️ 后端端点尚未落地（task-20 时点）；形状以后端为准，前端 normalizeTouchStats 写得宽容，落地后对齐字段名即可。
+ */
+/**
+ * 玩具接口的**场景参数**（2026-10-03 群聊 bug，两位独立审查者复现）。
+ *
+ * 为什么必须带：前端以前从不告诉服务端"这一下是在群里点的" ⇒ 后端按私聊口径写 `char_<id>` +
+ * `proactive_message`，而群聊页只认 `group_message` / `group_message_update`（`stores/groups.js`）
+ * ⇒ 玩家在群聊玩具面板里装/调/摘，她的反应与配图**全跑到私聊**、群里什么都看不到。
+ * 口径与 touch / 亲密一致：**不传 = 私聊**（URL 与请求体逐字节与改造前一致，老调用点零改动）；
+ * `scene='group'` 时才带上 groupId（group 场景缺 groupId 时后端回 400 人话，所以照传不吞）。
+ * 位置：参数统一放**最后一个** `sceneOpts`，调用方只有 ToyPanel / GroupChatView 两处。
+ */
+function toySceneFields({ scene, groupId } = {}) {
+  if (scene !== 'group') return {}
+  return { scene: 'group', groupId }
+}
+function toySceneQuery({ scene, groupId } = {}) {
+  if (scene !== 'group') return ''
+  const query = new URLSearchParams({ scene: 'group' })
+  // groupId 用 undefined/null/'' 判空：**0 是合法群 id，不能被假值判断吃掉**（同 fetchTouchState）
+  if (groupId !== undefined && groupId !== null && groupId !== '') query.set('groupId', String(groupId))
+  return `?${query.toString()}`
+}
+
+/**
+ * 玩具清单 + 佩戴状态（专题 §2.9-2）。
+ * 路径 / 形状以 `agent-core/src/routes/toys.js` 为准；形状不同时**只改这里**（组件侧刻意写得宽容）。
+ * 群聊里要带 `sceneOpts`：服务端据此给出**群里**的逐件门控（群聊成人开关关着 = 每件 allowed:false）。
+ */
+export function fetchToys(characterId, sceneOpts = {}) {
+  return request('/characters/' + characterId + '/toys' + toySceneQuery(sceneOpts))
+}
+
+// ⚠️ 2026-10-01 真机 bug：这三个函数原来写的是 `body: JSON.stringify({ intensity })`，
+// 而下面的 request() 基元**自己就会 stringify**（`JSON.stringify(body)`）——
+// 于是发出去的是 `"{\"intensity\":1}"`（一个 JSON 字符串），Express 的 body-parser 直接报
+// `Unexpected token '"', ""{\"intensity\":1}"" is not valid JSON`，现象就是「玩具一点就报错」。
+// 契约：`body` 一律传**对象**，别在这里自己 stringify（对照 performTouchAction 的写法）。
+// ⚠️ 2026-10-01 真机 bug（第二条）：`POST /api/characters/13/toys/undefined/equip`。
+// `encodeURIComponent(undefined)` 会**静默变成字符串 `"undefined"`**，于是请求打到
+// `/toys/undefined/equip`、服务端只能回 404/400 —— 用户看到的就是「玩具一点就报错」，
+// 而根因在前端某条路径拿不到 key，日志里完全看不出。这里加一道共用闸门：
+// key 缺失时**当场抛人话错误**（调用方 ChatView 三个 handler 都有 try/catch + toast），
+// 绝不再让 `undefined` 变成 URL 的一部分。
+function requireToyKey(toyKey) {
+  const key = typeof toyKey === 'string' ? toyKey.trim() : ''
+  if (!key || key === 'undefined' || key === 'null') {
+    const err = new Error('玩具标识缺失，请刷新后重试')
+    err.code = 'toy_key_missing'
+    throw err
+  }
+  return encodeURIComponent(key)
+}
+
+// 场景参数（`sceneOpts`）统一放最后一个：群聊里必须传 `{ scene:'group', groupId }`，
+// 否则她的反应会写到私聊（见上面 toySceneFields 的说明）。不传 = 私聊，请求体逐字节不变。
+export function equipToy(characterId, toyKey, { intensity = 1 } = {}, sceneOpts = {}) {
+  return request('/characters/' + characterId + '/toys/' + requireToyKey(toyKey) + '/equip', {
+    method: 'POST', body: { intensity, ...toySceneFields(sceneOpts) },
+  })
+}
+
+export function setToyIntensity(characterId, toyKey, intensity, sceneOpts = {}) {
+  return request('/characters/' + characterId + '/toys/' + requireToyKey(toyKey) + '/set-intensity', {
+    method: 'POST', body: { intensity, ...toySceneFields(sceneOpts) },
+  })
+}
+
+export function removeToy(characterId, toyKey, sceneOpts = {}) {
+  return request('/characters/' + characterId + '/toys/' + requireToyKey(toyKey) + '/remove', {
+    method: 'POST', body: { ...toySceneFields(sceneOpts) },
+  })
+}
+
+/**
+ * 批量装卸（2026-10-04 用户：「玩具不能批量装卸 还得一个个点 比较麻烦」）。
+ *
+ * 与单件的区别（**这是设计，不是省略**）：
+ *   · 单件 `equipToy` / `removeToy` 走父组件 handler ⇒ 会产一条**她的反应消息**；
+ *   · 批量是**静默操作** ⇒ 只改穿戴状态 + 服务端广播一次 `toys_batch_changed`，**不产反应**。
+ *     用户要的就是"别一个个点"；逐件调模型会把面板刷爆、还白烧额度。
+ *     想要带反应的就继续用单件那两条（接口一字未动）。
+ *
+ * @param {number} characterId
+ * @param {{action?: 'equip'|'remove', toyKeys?: string[], intensity?: number}} opts
+ *        `toyKeys` 不传 ⇒ 装上＝全部可用 / 摘下＝当前已戴的全部
+ * @param {{scene?: string, groupId?: number}} sceneOpts 群聊必须传，否则状态写错场景
+ * @returns {Promise<{ok:boolean, unlocked:boolean, action:string, applied:string[],
+ *                    skipped:{toyKey:string,reason:string}[], worn:any[]}>}
+ */
+export function batchToys(characterId, { action = 'equip', toyKeys, intensity } = {}, sceneOpts = {}) {
+  const body = { action, ...toySceneFields(sceneOpts) }
+  if (Array.isArray(toyKeys) && toyKeys.length > 0) body.toyKeys = toyKeys.map(k => requireToyKey(k))
+  if (intensity !== undefined) body.intensity = intensity
+  return request('/characters/' + characterId + '/toys/batch', { method: 'POST', body })
+}
+
+export function fetchTouchStats(characterId) {
+  return request(`/characters/${characterId}/touch/stats`)
+}
+
+/** 执行一次动作；返回体可能 allowed:false（她不愿意），也可能是成功后的即时反应与提醒 */
+export function performTouchAction(characterId, actionKey, { mode, scene, groupId } = {}) {
+  return request(`/characters/${characterId}/touch/${actionKey}`, {
+    method: 'POST',
+    body: { mode, scene, groupId },
+  })
+}
+
+/**
+ * 反重复采样参数（presence_penalty / frequency_penalty）。
+ * 传 null / '' = 清空 → 后端请求体里完全不发送该字段（与加参数前的请求体逐字节一致）。
+ */
+export function updateAntiRepetitionPenalty({ presence, frequency } = {}) {
+  return request(`/config/anti-repetition`, { method: 'PUT', body: { presence, frequency } })
+}
+
+/**
+ * 「AI 判断行为」的每日判定上限（全局配额，与角色无关）。
+ * 读侧：GET /api/config 顶层 aiJudge = { dailyLimit, usedToday, remaining, unlimited }；
+ * 写侧：PUT /api/config/ai-judge 返回同一个对象（dailyLimit 传 0 = 不限制）。
+ */
+export function updateAiJudgeDailyLimit(dailyLimit) {
+  return request('/config/ai-judge', { method: 'PUT', body: { dailyLimit: Number(dailyLimit) } })
 }
 
 /** 更新主动聊天频率 0~1 */
@@ -570,6 +739,94 @@ export async function activateLlmProfile(id) {
 
 export async function syncActiveLlmProfile() {
   await request(`/config/llm/profiles/active/sync`, { method: 'PUT' })
+}
+
+// ── 上下文窗口用量 / 压缩 ──
+// 走 jsonRequest：需要把 409（正在压缩）的 status 透传给调用方区分提示，
+// 而 request() 会把状态码吞成一个普通 Error。
+
+/** 当前会话的上下文用量（conversationId 形如 char_2 / group_7） */
+export function getContextUsage(conversationId) {
+  return jsonRequest(`/api/context/usage?conversationId=${encodeURIComponent(conversationId)}`)
+}
+
+/** 手动压缩当前会话上下文；服务端已有压缩在跑时抛 status=409 */
+export function compressContext(conversationId) {
+  return jsonRequest('/api/context/compress', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversationId }),
+  })
+}
+
+// ── 数据备份（一键导出 / 一键导入）──
+//
+// 契约（后端 agent-core/src/routes/data.js）：
+//   GET  /api/data/export?includeConfig=0|1 → 200 二进制 tar.gz（Content-Disposition 给文件名）
+//   GET  /api/data/export/info              → { ok, dbBytes, counts, lastExportAt }
+//   POST /api/data/import                   → body 为归档原始字节，Content-Type: application/gzip
+//
+// 导出/导入都绕开 request()：一个要拿二进制 blob + 响应头，一个要发非 JSON 的原始字节。
+// 失败时把后端的人话（error / detail）和 backupPath 挂在 Error 上交给页面展示。
+
+/** 导出摘要：角色/消息/群/记忆条数 + 预估大小（dbBytes 是估算上界，文案不写「精确」） */
+export function getDataExportInfo() {
+  return request('/data/export/info')
+}
+
+function backupError(status, payload) {
+  const result = payload && typeof payload === 'object' ? payload : {}
+  const error = new Error(result.error || result.detail || `请求失败 (${status})`)
+  error.status = status
+  error.detail = result.detail || ''
+  // 500 时后端会把导入前的自动备份路径带回来，页面必须能显示它以便回滚
+  error.backupPath = result.backupPath || ''
+  return error
+}
+
+/**
+ * 触发浏览器下载整个数据归档。
+ * @param {boolean} includeConfig 是否把 config/.env（含 API Key）一起打包
+ * @returns {Promise<{fileName:string, bytes:number}>}
+ */
+export async function downloadDataArchive(includeConfig = false) {
+  const res = await fetch(`${BASE}/data/export?includeConfig=${includeConfig ? 1 : 0}`)
+  if (!res.ok) throw backupError(res.status, await res.json().catch(() => ({})))
+  const blob = await res.blob()
+  const fileName = parseBackupFileName(res.headers.get('Content-Disposition')) || defaultBackupFileName()
+  saveBlobAsFile(blob, fileName)
+  return { fileName, bytes: blob.size }
+}
+
+/**
+ * 上传归档并覆盖当前数据。上传前必须已经二次确认过。
+ * @param {File|Blob} file 原始 .tar.gz 字节
+ * @returns {Promise<{ok:boolean, restored:object, backupPath:string, restartRecommended:boolean, message:string}>}
+ */
+export async function importDataArchive(file) {
+  const res = await fetch(`${BASE}/data/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/gzip' },
+    body: file,
+  })
+  const result = await res.json().catch(() => ({}))
+  if (!res.ok) throw backupError(res.status, result)
+  return result
+}
+
+/** 临时 <a download> 触发下载（不进模板，因此不受「不用裸元素」约束） */
+function saveBlobAsFile(blob, fileName) {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  link.rel = 'noopener'
+  link.style.display = 'none'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  // 立刻 revoke 会让部分浏览器中断下载，留足时间再回收
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
 }
 
 // ── Chat Memory ──
@@ -1057,6 +1314,17 @@ export async function deleteEvent(eventId) {
   return request(`/events/${eventId}`, { method: 'DELETE' })
 }
 
+/**
+ * 给已有奇遇补一张配图（§3.5）
+ * 后端用行里存的 prompt/style/resolution 重跑一次生图链路。
+ * 成功 `{ok:true, image:'/images/events/…'}`；
+ * 失败 `{ok:false, error:'人话原因'}` —— 注意失败也是 200，
+ * 这里要把它当"一次正常的业务结果"来处理（把 error 显示给用户），不要当成请求异常。
+ */
+export async function regenerateEventImage(eventId) {
+  return request(`/events/${eventId}/image`, { method: 'POST' })
+}
+
 export async function getEventsUnread() {
   return request(`/events/unread-count`)
 }
@@ -1171,6 +1439,17 @@ export function getCharacterSchedule(characterId) {
 
 export function getCurrentActivity(characterId) {
   return request(`/schedule/${characterId}/current`)
+}
+
+/**
+ * 她今天的「私密时刻」（2026-10-02 新玩法：自慰 / 你闯进来了）。
+ *
+ * 用户原话：「再增加一个事件 叫自慰 和角色敏感度也相关 越高发生概率也就越高 这个可以算到日程里」。
+ * 返回 `{ characterId, has, active, caught, label, line, startTime, endTime, minutesLeft }`；
+ * `has:false` ⇒ 今天没有这一段（前端零渲染）。判定在后端是确定性的，轮询不会闪来闪去。
+ */
+export function getPrivateMoment(characterId) {
+  return request(`/schedule/${characterId}/private-moment`)
 }
 
 /** 编辑单条日程（标记为已编辑，进入当天特殊朋友圈队列） */
@@ -1452,6 +1731,19 @@ export function travelTown(targetMapId, { expectedPlayerRevision = null, worldId
 // 世界页在线打点：TownView 挂载期间定期调用，服务端据此开启相遇/气泡等页面演出
 export function townViewerHeartbeat() {
   return jsonRequest(`${BASE}/town/viewer/heartbeat`, townJson('POST'))
+}
+
+// 居民详细状态（需求/心情/目标/技能/最近来往，只读展示层）
+export function fetchTownActorStatus(actorId) {
+  return jsonRequest(`${BASE}/town/actors/${encodeURIComponent(actorId)}/status`)
+}
+
+// 居民活动流水（只读展示层）：全镇信息流（左上角浮窗/动态面板）+ 单居民行动记录
+export function fetchTownActivity(limit = 40) {
+  return jsonRequest(`${BASE}/town/activity?limit=${encodeURIComponent(limit)}`)
+}
+export function fetchTownActorActivity(actorId, limit = 100) {
+  return jsonRequest(`${BASE}/town/actors/${encodeURIComponent(actorId)}/activity?limit=${encodeURIComponent(limit)}`)
 }
 
 // 玩家 token 移动（服务端寻路 + town_move 广播）；带 mapId 让跨图后的旧请求被服务端拒掉
@@ -1741,6 +2033,10 @@ export function releaseTownActor(actorId, { worldId, worldEpoch } = {}) {
   return jsonRequest(`${BASE}/town/actors/${encodeURIComponent(actorId)}/release`, townJson('POST', { worldId, worldEpoch }))
 }
 
+export function carryTownActor(actorId, body) {
+  return jsonRequest(`${BASE}/town/actors/${encodeURIComponent(actorId)}/carry`, townJson('POST', body))
+}
+
 
 export function regenerateTownPlayerPortrait(overrides = {}) {
   return jsonRequest(`${BASE}/town/player/portrait`, townJson('POST', overrides))
@@ -1753,6 +2049,8 @@ export { getTownWallet, executeTownLifeCommand, createTownTargetTradeCommand,
 
 // 独立角色表情立绘；与普通立绘和小镇素材分开存储。
 const expressionStandingPath = (id, slot = '') => `/characters/${id}/expression-standings${slot ? '/' + encodeURIComponent(slot) : ''}`
+export const getStandingOverview = () => request('/expression-standings/overview')
+export const generateAllExpressionStandings = body => request('/expression-standings/generate', { method: 'POST', body })
 export const listExpressionStandings = id => request(expressionStandingPath(id))
 export const generateExpressionStandings = (id, body) => request(expressionStandingPath(id) + '/generate', { method: 'POST', body })
 export const controlExpressionStandingTask = (id, jobId, action) => request(expressionStandingPath(id) + `/jobs/${encodeURIComponent(jobId)}/${action}`, { method: 'POST' })
@@ -1760,4 +2058,113 @@ export const updateExpressionStandingPrompt = (id, slot, prompt, generation) => 
 export const editExpressionStanding = (id, slot, action, body = {}) => request(expressionStandingPath(id, slot) + '/' + action, { method: 'POST', body })
 export const deleteExpressionStanding = (id, slot) => request(expressionStandingPath(id, slot), { method: 'DELETE' })
 export const getStandingDisplayState = () => request('/standing-display/state')
+export const getStandingInteraction = id => request(`/characters/${id}/standing-interaction`)
+export const getStandingTouchLines = id => request(`/characters/${id}/expression-standings/touch-lines`)
+export const saveStandingTouchLines = (id, body) => request(`/characters/${id}/expression-standings/touch-lines`, {method:'PUT',body})
+export const generateStandingTouchLines = (id, expectedVersion) => request(`/characters/${id}/expression-standings/touch-lines/generate`, {method:'POST',body:{expectedVersion}})
 export const setStandingDisplayCharacter = body => request('/standing-display/active', { method: 'PUT', body })
+
+// ── 角色资产「一键后台生成」（2026-10-01）────────────────────────────────────
+// 后端 `agent-core/src/routes/assetGeneration.js`；计划由**后端**展开（前端不自己算张数）。
+export const createAssetGenerationJob = body => request('/asset-generation/jobs', { method: 'POST', body })
+export const getAssetGenerationJob = jobId => request(`/asset-generation/jobs/${encodeURIComponent(jobId)}`)
+export const listAssetGenerationJobs = ({ active = false } = {}) =>
+  request(`/asset-generation/jobs${active ? '?active=1' : ''}`)
+export const controlAssetGenerationJob = (jobId, action) =>
+  request(`/asset-generation/jobs/${encodeURIComponent(jobId)}/${encodeURIComponent(action)}`, { method: 'POST', body: {} })
+
+// ── 程序时间（世界钟）感知快照（2026-10-02 task-3 追加）──────────────────────────
+// 只读：后端 `agent-core/src/routes/time.js` 的 `GET /api/time/perception`
+// （同一个 router 也挂在旧路径 `/api/schedule/time/perception`，形状一致）。
+// 返回**与注入提示词同源**的时间标签（后端现算 `timeLight.getTimeTag()` / `getTimeLightTag()` /
+// `getLightHint()`）+ 各角色此刻的时段 / 光线 / 在做什么。
+// 纪律：前端**不自己算偏移**（偏移只存在于后端 `program_time_state`），这里只负责取数，
+// 并把后端的机器码翻成人话（409 `time control disabled` 等）。
+export async function getTimePerception({ signal } = {}) {
+  try {
+    return await request('/time/perception', { signal })
+  } catch (err) {
+    const text = String(err?.message || '')
+    if (/disabled/i.test(text)) throw new Error('程序时间功能当前已关闭')
+    if (/not found|Cannot GET|请求失败 \(404\)/i.test(text)) throw new Error('后端还没有时间感知接口（等更新）')
+    throw err
+  }
+}
+
+// ── 性爱交互「可点击推进」（2026-10-01 task-1 追加）─────────────────────────────
+// 后端 `agent-core/src/routes/intimateActions.js`，**独立前缀** `/api/intimate-actions`
+// （不走 /api/characters：那一族里 intimate 与 characters 必须紧邻挂载，是冻结契约）。
+//
+// 契约（与面板 IntimateActionPanel.vue 一一对应）：
+//   GET  /api/intimate-actions/:id/state          → { characterId, enabled, state, her, position, positionOptions, paceLevels, actions }
+//   POST /api/intimate-actions/:id/:action        → body { positionKey }（只有换姿势需要）
+//        · 成功   ：{ allowed:true, code:'ok', state, reaction|null, message|null, beat, climaxed, ... }
+//        · 被拒   ：HTTP 200 + { allowed:false, code, message }（message 已是人话 → 直接 toast）
+//        · 400/404/409 交给 request() 抛错（它已经优先取 `message` 人话）
+
+/**
+ * 读进行中状态 + 体位清单 + 逐动作可用性（面板打开 / 每次动作后刷新）
+ *
+ * 2026-10-02：加**场景**参数（用户报「群聊里点插入动作，消息跑到私聊」）——
+ * `scene='group'` 时必须带 `groupId`，后端校验"群存在 + 她是成员"并把会话切到 `group_<gid>`；
+ * 不传 = 私聊（老调用逐字不变）。
+ */
+export function fetchIntimateActionState(characterId, { scene = 'chat', groupId = null, signal } = {}) {
+  const query = scene === 'group' && groupId ? `?scene=group&groupId=${encodeURIComponent(groupId)}` : ''
+  return request(`/intimate-actions/${encodeURIComponent(characterId)}/state${query}`, { signal })
+}
+
+/**
+ * 点一下推进。
+ * @param {number|string} characterId
+ * @param {'enter'|'thrust'|'faster'|'slower'|'stop'|'position'|'climax'} actionKey
+ * @param {{positionKey?:string, scene?:'chat'|'group', groupId?:number|string}} [payload]
+ *        换姿势必带目标体位 key；**群聊场景必须带** `scene:'group'` + `groupId`（否则她的反应会落到私聊）
+ */
+export function postIntimateAction(characterId, actionKey, payload = {}) {
+  return request(`/intimate-actions/${encodeURIComponent(characterId)}/${encodeURIComponent(actionKey)}`, {
+    method: 'POST',
+    body: payload && Object.keys(payload).length ? payload : {},
+  })
+}
+
+// ── 玩具玩法扩充（2026-10-02 task-2 追加）──────────────────────────────────────
+// 后端同一个 router：`agent-core/src/routes/toys.js`（已由 app.js 挂在 `/api/characters`，
+// **不需要新挂载点**）。契约：
+//   POST /characters/:id/toys/:toyKey/mode   body { mode }   → 振动模式（steady/pulse/wave/random）
+//   POST /characters/:id/toys/:toyKey/curve  body { curve }  → 强度曲线；`null` / 'off' 关掉
+//   POST /characters/:id/toys/tick           body {}         → **推进曲线**（返回本 tick 的档位变化）
+//   GET  /characters/:id/toys/self-play                       → 她自己会不会玩的判定预览（无副作用）
+//   POST /characters/:id/toys/self-play      body { encourage } → 让她自己判断一次（愿意才真的动手）
+// 口径：`GET /toys` 已经顺带 tick（面板轮询它就能看到 liveIntensity 在变）；模式/曲线只对
+// **已佩戴**的玩具生效，未佩戴后端回 404 `toy_not_worn` —— 前端不自己拦（服务端说了算）。
+// 场景：群聊里这五个（含 tick / 判定预览）都要带 `sceneOpts = { scene:'group', groupId }` ——
+// 她自己玩那一句台词是要**发在她正在聊的那个地方**的（2026-10-03 群聊 bug，见 toySceneFields）。
+export function setToyMode(characterId, toyKey, mode, sceneOpts = {}) {
+  return request('/characters/' + characterId + '/toys/' + requireToyKey(toyKey) + '/mode', {
+    method: 'POST', body: { mode, ...toySceneFields(sceneOpts) },
+  })
+}
+
+export function setToyCurve(characterId, toyKey, curve, sceneOpts = {}) {
+  return request('/characters/' + characterId + '/toys/' + requireToyKey(toyKey) + '/curve', {
+    method: 'POST', body: { curve: curve || null, ...toySceneFields(sceneOpts) },
+  })
+}
+
+export function tickToys(characterId, sceneOpts = {}) {
+  return request('/characters/' + characterId + '/toys/tick', { method: 'POST', body: { ...toySceneFields(sceneOpts) } })
+}
+
+export function getSelfPlayState(characterId, sceneOpts = {}) {
+  return request('/characters/' + characterId + '/toys/self-play' + toySceneQuery(sceneOpts))
+}
+
+export function triggerSelfPlay(characterId, { encourage = false } = {}, sceneOpts = {}) {
+  return request('/characters/' + characterId + '/toys/self-play', {
+    method: 'POST', body: { encourage, ...toySceneFields(sceneOpts) },
+  })
+}
+
+
+export const fillAllStandingTouchLines = () => request('/expression-standings/touch-lines/fill', { method:'POST' })

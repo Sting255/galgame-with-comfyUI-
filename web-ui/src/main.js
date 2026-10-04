@@ -6,9 +6,15 @@ import './styles/base.css'
 import './styles/components.css'
 import './styles/animations.css'
 import { initTheme } from './theme.js'
+// 坏图兜底（2026-10-02）：库里 606 条 /images/** 引用指向已被清理的图 ⇒ 装一个全局兜底，
+// 图片加载失败时隐藏、或按 data-img-fallback="text" 换成中文占位，不再出现浏览器碎图。
+// 只处理同源的 /images/** 与 /avatars/**（外链与 data: 不碰）⇒ 正常图片零影响。
+import { installImageFallback } from './imageFallback.js'
 
 // 挂载前同步应用本地主题，避免首帧闪烁
 initTheme()
+// 越早装越好：首屏渲染出来的图也走同一套兜底
+installImageFallback()
 
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'

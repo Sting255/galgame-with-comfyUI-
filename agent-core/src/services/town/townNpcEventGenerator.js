@@ -10,21 +10,30 @@
 import { getDb, getSystemRules, getSystemRulesWithWorld, getWorldSetting, getGlobalRule } from '../../db/index.js';
 import { chatSync as defaultChatSync } from '../../llm/llm-client.js';
 import { generateImageRaw as defaultGenerateImageRaw } from '../imageSkill.js';
-import { recordCompletedImageTask } from '../imageTaskRecorder.js';
+import { recordCompletedImageTask, recordFailedImageTask } from '../imageTaskRecorder.js';
 import { saveBase64Image } from '../imagePaths.js';
 import { config } from '../../config.js';
 import { getTimeTag, getLightNoteWithWeather } from '../timeLight.js';
 import { getWorldIntegrationRule } from '../../builtinRules.js';
 import { extractFirstJson, repairJson } from '../eventGenerator.js';
+import { createTownNarrativeService } from './townNarrativeService.js';
 import {
   broadcastNewEvent,
   broadcastEventUpdate,
   broadcastEventConclusion,
 } from '../eventNotificationBus.js';
+// 亲密看板：镇民奇遇的画面记账。镇民奇遇落在 town_npc_events、不走 concludeEvent，
+// 所以角色奇遇那套收尾记账覆盖不到它（详见 townIntimateRecord.js 的归因规则）
+import { recordIntimateForTownEvent } from './townIntimateRecord.js';
 
 export const TOWN_NPC_EVENT_TYPE_KEY = 'town.custom';
 export const TOWN_NPC_AMBIENT_EVENT_TYPE_KEY = 'town.ambient';
 export const TOWN_NPC_EVENT_DURATION_MIN = 60;
+
+// M7 自动叙事（town-update.md §6.8）：ambient 奇遇（镇民自发场景 + 导演邀请）创建时，
+// 给已落库的场景补一段角色对白。纯表现层——契约不过/预算耗尽/零模型一律不落
+// narrative_json，卡片维持纯描述；叙事永不参与事件结算。
+const townNarrative = createTownNarrativeService({ narrativeConfig: config.town.narrative });
 
 // ── ID 与素材工具 ──
 
@@ -53,11 +62,17 @@ function toISO(dt) {
   return dt.replace(' ', 'T') + '.000Z';
 }
 
+/** narrative_json → 前端对话块（解析失败视同无叙事，不阻塞卡片渲染）。 */
+function narrativeOf(row) {
+  if (!row?.narrative_json) return null;
+  try { return JSON.parse(row.narrative_json); } catch { return null; }
+}
+
 /** 活跃事件行 → 前端 EventCard 可直接消费的 DTO（id 加 town: 前缀避免与角色事件撞号）。 */
 export function townNpcEventDto(row, npcName = null) {
   if (!row) return null;
   const npc = npcName ?? getDb().prepare('SELECT display_name FROM town_npcs WHERE id=?').get(row.npc_id)?.display_name;
-  return {
+  const dto = {
     ...row,
     id: townNpcEventRef(row.id),
     npc_event: true,
@@ -68,13 +83,16 @@ export function townNpcEventDto(row, npcName = null) {
     created_at: toISO(row.created_at),
     expires_at: toISO(row.expires_at),
     last_interaction_at: row.last_interaction_at ? toISO(row.last_interaction_at) : null,
+    narrative: narrativeOf(row),
   };
+  delete dto.narrative_json; // 原始串不透出，前端只读解析后的 narrative
+  return dto;
 }
 
 /** 历史事件行 → 前端 DTO（与 event_history 的 final_image 口径对齐）。 */
 export function townNpcEventHistoryDto(row) {
   if (!row) return null;
-  return {
+  const dto = {
     ...row,
     image: row.final_image,
     id: townNpcEventRef(row.id),
@@ -87,7 +105,10 @@ export function townNpcEventHistoryDto(row) {
     expires_at: toISO(row.ended_at),
     created_at: row.created_at ? toISO(row.created_at) : null,
     last_interaction_at: null,
+    narrative: narrativeOf(row),
   };
+  delete dto.narrative_json;
+  return dto;
 }
 
 function npcPersonaBlock(npc, playerName, playerAppearance) {
@@ -201,10 +222,17 @@ export async function generateTownNpcEvent(npc, options = {}) {
 
   const formatPrompt = `请严格按照以下 JSON 格式输出，不要任何解释或额外文字：
 
+【prompt 字段的写作规范】
+${imagePromptInstruction}${weatherHint}${twoPersonNote}
+
+⚠️ 上面这段是**规范**，不是内容：照它的要求**自己写一段画面描述**填进 prompt 字段，
+**绝对不要把它原文抄进 JSON**，也不要出现「Describe the image」「Follow this progression」
+「Scene Setting」「Environment & Props」「Hard Rules」这类规范字样。
+
 {
   "title": "事件标题（≤8字，口语感叹。从你刚写完的现场里抓最戳人的那个瞬间，用当事人的第一反应喊出来——不要给事件'取名'。正确：这缸布全废了？！|你的手在抖啊。错误：裁缝铺的麻烦|意外的委托——这些是在概括事件。禁止万能感叹'天哪''不是吧'——必须带上这个奇遇的具体信息点）",
   ${sceneConstraint},
-  "prompt": "${imagePromptInstruction}${weatherHint}${twoPersonNote}",
+  "prompt": "（这里填**你写好的那一整段英文画面描述**：按上面的规范，写清场景环境、两位当事人在做什么、道具与光线氛围；整段连贯英文，严禁中文，严禁照抄上面的规范原文）",
   ${choiceConstraint}
 }
 
@@ -310,9 +338,29 @@ ${worldPenetrationLine}
       console.log(`[townNpcEventGen] Image generated for ${npc.display_name}: ${imageUrl}`);
     } else {
       console.warn(`[townNpcEventGen] Image generation returned no images for ${npc.display_name}`);
+      // 2026-10-01：失败落库（原来只 warn，库里零痕迹）
+      recordFailedImageTask({
+        conversationId: `town_npc_${npc.id}_events`,
+        promptOriginal: originalEventPrompt,
+        promptRefined: eventData.prompt,
+        errorMessage: genResult.error || 'ComfyUI 未返回图片',
+        style: config.comfyui.eventArtist,
+        resolution: `${config.comfyui.eventWidth}x${config.comfyui.eventHeight}`,
+        workflowTemplate: genResult.wfMode || null,
+        db,
+      });
     }
   } catch (err) {
     console.error(`[townNpcEventGen] Image generation failed for ${npc.display_name}:`, err.message);
+    recordFailedImageTask({
+      conversationId: `town_npc_${npc.id}_events`,
+      promptOriginal: originalEventPrompt,
+      promptRefined: eventData.prompt,
+      errorMessage: err.message,
+      style: config.comfyui.eventArtist,
+      resolution: `${config.comfyui.eventWidth}x${config.comfyui.eventHeight}`,
+      db,
+    });
     // 无图片也继续
   }
 
@@ -359,7 +407,59 @@ ${worldPenetrationLine}
     return id;
   }).immediate();
 
+  // 自动叙事（M7）：两条 ambient 生成路径（自发升级/导演邀请）都已按「聚焦图 + 自动 LLM」
+  // 门控后才走到这里，这里只补预算与契约（narrate 内部处理）。手动玩家邀请（town.custom）不叙事。
+  if (isAmbient && config.features.townLLM && config.features.townAutoLLM) {
+    try {
+      const { source, narrative } = await townNarrative.narrate({
+        sourceEventId: townNpcEventRef(eventId),
+        factsVersion: 1,
+        facts: {
+          text: `事件「${eventData.title}」：${eventData.description}`,
+          fallbackSummary: eventData.description.slice(0, 80),
+          fallbackLine: `${npc.display_name}正忙着手头的事。`,
+        },
+        allowedSpeakers: [
+          { actorId: `npc:${npc.id}`, displayName: npc.display_name },
+          ...(companion ? [{ actorId: `companion:${npc.id}`, displayName: companion.name }] : []),
+        ],
+        choices: [], // 对白增强口径：不重标选项，玩家按钮仍用 choice_a/b
+        worldId: options.worldId ?? 'town',
+        nowUtcMs: now.getTime(),
+        mode: 'auto',
+        chatSync,
+      });
+      if (source === 'model') {
+        db.prepare('UPDATE town_npc_events SET narrative_json = ? WHERE id = ?').run(JSON.stringify(narrative), eventId);
+      }
+    } catch (err) {
+      console.warn('[townNpcEventGen] narrative enhancement skipped:', err?.message || err);
+    }
+  }
+
   const event = db.prepare(`SELECT * FROM town_npc_events WHERE id = ?`).get(eventId);
+
+  // 亲密看板：镇民奇遇记账（零 LLM 的确定性 tag 归类）。
+  // 只有"已关联酒馆角色"的镇民才有 characters 行可归属，纯 NPC 直接跳过；
+  // 环境奇遇（两位镇民同框）记 partnerKind='npc'，常规奇遇（镇民+玩家）记 'user'。
+  // 失败只告警——看板统计绝不能影响奇遇创建主流程；幂等靠显式 sourceUid（见 townIntimateRecord.js）。
+  try {
+    const linkedCharId = Number.parseInt(npc.character_id, 10) || 0;
+    if (linkedCharId > 0 && eventData.prompt) {
+      const recorded = recordIntimateForTownEvent({
+        characterId: linkedCharId,
+        eventId,
+        prompt: eventData.prompt,
+        partnerKind: isAmbient ? 'npc' : 'user',
+      });
+      if (recorded.inserted > 0) {
+        console.log(`[townNpcEventGen] intimate recorded for town event ${eventId}: +${recorded.inserted}`);
+      }
+    }
+  } catch (err) {
+    console.warn('[intimate] town event record failed:', err.message);
+  }
+
   broadcastNewEvent(townNpcEventDto(event));
 
   console.log(`[townNpcEventGen] Event created for ${npc.display_name}: "${event.title}" (expires=${expiresAt})`);
@@ -428,9 +528,16 @@ export async function generateTownNpcNextBranch(npc, event, choice, deps = {}) {
 
     const formatPrompt = `请严格按照以下 JSON 格式输出，不要任何解释或额外文字：
 
+【prompt 字段的写作规范】
+${branchImagePromptInstruction}${weatherHint}${twoPersonNote}
+
+⚠️ 上面这段是**规范**，不是内容：照它的要求**自己写一段画面描述**填进 prompt 字段，
+**绝对不要把它原文抄进 JSON**，也不要出现「Describe the image」「Follow this progression」
+「Scene Setting」「Environment & Props」「Hard Rules」这类规范字样。
+
 {
   "description": "选择后的场景叙述，承接上一个选择的结果，展现两人此刻的即时感受和新出现的局面，玩家${playerName}和${displayName}必须同时出现在现场。场景转折要出乎意料但又在情理之中（80-150字）。采用紧密第三人称，始终贴着现场中两人的感知与动作。结尾停在『必须做出选择之前』，留下悬念。行动需要符合当前天气和时间，但禁止直接提及天气时间。",
-  "prompt": "${branchImagePromptInstruction}${weatherHint}${twoPersonNote}",
+  "prompt": "（这里填**你写好的那一整段英文画面描述**：按上面的规范，写清承接这次选择之后的场景、两位当事人在做什么、道具与光线氛围；整段连贯英文，严禁中文，严禁照抄上面的规范原文）",
   "choiceA": "新选项A（具体行动，8-15字。是玩家${playerName}和${displayName}接下来真的会一起做的事）",
   "choiceB": "新选项B（与A形成真正的行动对比，把奇遇往意料之外但符合小镇日常的情况发展。8-15字）"
 }`;
@@ -592,8 +699,8 @@ function archiveNpcEvent(npc, event, outcome, conclusionData) {
   db.transaction(() => {
     db.prepare(`
     INSERT INTO town_npc_event_history (id, npc_id, event_type_key, title, description, final_image, summary, conclusion,
-      choice_history, total_branches, engaged, outcome, world_id, world_epoch, location_key, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      choice_history, total_branches, engaged, outcome, world_id, world_epoch, location_key, created_at, narrative_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
       event.id,
       npc.id, event.event_type_key,
@@ -604,6 +711,7 @@ function archiveNpcEvent(npc, event, outcome, conclusionData) {
       event.engaged, outcome,
       event.world_id, event.world_epoch, event.location_key,
       event.created_at,
+      event.narrative_json ?? null,
     );
     db.prepare(`DELETE FROM town_npc_events WHERE id = ?`).run(event.id);
   }).immediate();

@@ -26,7 +26,7 @@ import {
   getTownState, movePlayerTo, movePlayerDir, getEncounterMessages,
   setTownCharacterEnabled, setTownCharacterCapabilities, ensureCharacterNpcProfile, listTownCharacters, forceTick, setNpcEnabled, reloadTown,
   generateCharacterSprites, ensureCharacterTownAssets, getTownSettings, updateTownSettings, resetWorld, resetMap,
-  holdTownActor, releaseTownActor, touchTownViewer,
+  holdTownActor, releaseTownActor, carryTownActor, touchTownViewer,
   getTownMaps, travelPlayer, reloadMap,
 } from '../services/town/townService.js';
 import {
@@ -38,6 +38,8 @@ import { buildAssetRequestSnapshot } from '../services/town/townAssetRequest.js'
 import { getMapPayload, saveMap, renameMap } from '../services/town/townMapService.js';
 import { getTownWallet, getTownNpcFunctions, receiveTownNpcGift, getTownEconomyContext, buyTownNpcStock } from '../services/town/townEconomyRuntime.js';
 import { getTownNpcStockView } from '../services/town/townNpcStockService.js';
+import { getTownActivityFeed } from '../services/town/townActivityFeed.js';
+import { getTownResidentStatus } from '../services/town/townResidentStatus.js';
 import { listNpcOffers, generateNpcOffers, rerollNpcOffer, listOfferOverview } from '../services/town/townNpcOfferService.js';
 import { startNpcService, continueNpcService, listNpcServiceSessions } from '../services/town/townNpcServiceRuntime.js';
 import { getTownInteractions, offerTownInteraction, respondTownInteraction, getTownTargetTrade, executeTownTargetTrade } from '../services/town/townInteractionRuntime.js';
@@ -63,6 +65,30 @@ const router = Router();
 router.get('/state', (req, res) => {
   // mapId 省略 = 玩家当前那张图；显式指定用于出行前预载目标图（不含玩家坐标）
   res.json(getTownState(req.query.mapId ?? null));
+});
+
+// ── 居民活动流水（只读展示层）：全镇信息流 + 单居民行动记录 ──
+
+router.get('/activity', (req, res) => {
+  res.json({ entries: getTownActivityFeed().recent({ limit: req.query.limit }) });
+});
+
+router.get('/actors/:actorId/status', (req, res) => {
+  const actorId = String(req.params.actorId || '');
+  if (!/^[-0-9a-zA-Z]{8,64}$/.test(actorId)) {
+    res.status(400).json({ code: 'INVALID_ACTOR', error: '居民标识无效' });
+    return;
+  }
+  res.json(getTownResidentStatus().ofActor(actorId));
+});
+
+router.get('/actors/:actorId/activity', (req, res) => {
+  const actorId = String(req.params.actorId || '');
+  if (!/^[-0-9a-zA-Z]{8,64}$/.test(actorId)) {
+    res.status(400).json({ code: 'INVALID_ACTOR', error: '居民标识无效' });
+    return;
+  }
+  res.json({ entries: getTownActivityFeed().ofActor(actorId, { limit: req.query.limit }) });
 });
 
 function checkMovementScope(body, res) {
@@ -112,6 +138,23 @@ router.post('/actors/:id/hold', (req, res) => {
 router.post('/actors/:id/release', (req, res) => {
   if (!checkMovementScope(req.body || {}, res)) return;
   res.json(releaseTownActor(req.params.id));
+});
+
+router.post('/actors/:id/carry', (req, res) => {
+  const body = req.body || {};
+  if (!Number.isSafeInteger(body.mapId) || typeof body.worldId !== 'string'
+      || !Number.isSafeInteger(body.worldEpoch)) {
+    return res.status(400).json({ code: 'INVALID_WORLD_SCOPE', error: '请先重新读取小镇' });
+  }
+  if (!checkMovementScope(body, res)) return;
+  if (!['begin', 'renew', 'drop', 'cancel'].includes(body.operation)) {
+    return res.status(400).json({ error: '无效的拎起操作' });
+  }
+  const result = carryTownActor(req.params.id, {
+    token: body.token, operation: body.operation, x: body.x, y: body.y,
+  });
+  if (!result.ok) return res.status(409).json(result);
+  res.json(result);
 });
 
 router.get('/encounters/:id/messages', (req, res) => {
@@ -230,7 +273,8 @@ const townCommandMessages = {
   SERVICE_SESSION_NOT_FOUND: '这段服务已经结束，请重新选择',
   SERVICE_JSON_MISSING: '这次的经历没能生成出来，请重试',
   SERVICE_PAYLOAD_INCOMPLETE: '这次的经历不完整，请重试',
-  SERVICE_IMAGE_FAILED: '画面没能画出来，请重试',
+  SERVICE_IMAGE_FAILED: '画面没能画出来，请重试',
+
   STOCK_JSON_MISSING: '这次没能生成出货品，请再试一次',
   STOCK_EMPTY: '这次没有生成出可用的货品，请再试一次',
   STOCK_NOT_FOUND: '这件货品已经不在货架上了',

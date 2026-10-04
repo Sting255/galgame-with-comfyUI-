@@ -19,6 +19,21 @@
           <polyline points="6 9 12 15 18 9" />
         </svg>
       </div>
+      <!-- 立绘 ↔ 世界观 一致性提示（2026-10-01，用户：「同步形象展示那边的立绘，需要根据现在的世界观去生成」）
+           数据来自 GET /api/characters 下发的 standing_stale（服务端用「世界观 id + 内容哈希」比对生成时记下的签名）。
+           reason='unknown' = 生成于该机制之前，无法确认；'world_changed' = 世界观换了或改了内容。 -->
+      <Transition name="sp-fade">
+        <div
+          v-if="character?.standing_stale"
+          class="standing-stale"
+          :title="character.standing_stale_reason === 'unknown'
+            ? '这张立绘生成于「世界观记录」之前，系统无法确认它是否吻合当前世界观'
+            : '世界观已更改，这张立绘还是上一套世界观的形象'"
+        >
+          <span class="standing-stale-dot" aria-hidden="true"></span>
+          <span class="standing-stale-text">立绘与当前世界观不一致，点「重新生成立绘」按现在世界观同步</span>
+        </div>
+      </Transition>
       <div
         class="standing-stage"
         role="button"
@@ -120,6 +135,32 @@ function onFileChange(e) {
 </script>
 
 <style scoped>
+/* 立绘 ↔ 世界观 不一致提示（2026-10-01）：一条窄提示条，落在面板头部与画面之间。
+   配色沿用告警语义的既有 token（不引入新色），节奏沿用 0.3s（AGENTS.md）。 */
+.standing-stale {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 10px 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(var(--accent-rgb), 0.10);
+  border: 1px solid rgba(var(--accent-rgb), 0.22);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.35;
+  transition: opacity 0.3s var(--ease-standard), transform 0.3s var(--ease-standard);
+}
+.standing-stale-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.standing-stale-text { flex: 1 1 auto; }
+.sp-fade-enter-active, .sp-fade-leave-active { transition: opacity 0.3s var(--ease-standard); }
+.sp-fade-enter-from, .sp-fade-leave-to { opacity: 0; }
 /* ═══ 立绘面板 ═══
    默认（桌面端）：主面板左侧的悬浮窗，与右侧 float 面板镜像；
    .is-inline（手机端）：收进详情卡正文末尾，换成与正文卡片同款的玻璃卡。 */

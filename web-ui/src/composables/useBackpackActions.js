@@ -43,6 +43,8 @@ export function useBackpackActions({ confirm, toast }) {
   const showCharPicker = ref(false)
   const pendingItem = ref(null)
   const detailItem = ref(null)
+  // 催眠手机：不走通用道具流程，改用专用面板（{ open, character }）
+  const hypnosisPhone = ref({ open: false, character: null })
   // 小镇货摊买来的礼物：送出后等图片 + 故事（复用小镇服务/打工的胶片展示）
   const giftStage = ref({ open: false, session: null })
   const removingEffectId = ref(null)
@@ -155,6 +157,8 @@ export function useBackpackActions({ confirm, toast }) {
     pendingItem.value = null
     detailItem.value = null
     giftStage.value = { open: false, session: null }
+    // 催眠手机面板也一并收起：重开背包时没人会期待它还浮在上面
+    hypnosisPhone.value = { open: false, character: null }
   }
 
   // ── 开箱：全屏蓄力 → 等图片生成完毕 → 开盖揭示 ──
@@ -292,6 +296,13 @@ export function useBackpackActions({ confirm, toast }) {
     const item = pendingItem.value
     if (!item) return
     showCharPicker.value = false
+    // 催眠手机不是消耗品：它开的是「状态面板」，不是一次性的道具效果。
+    // 所以在这里提前分流，不调用 store.useItem（否则会被后端当成普通道具消耗掉）。
+    if (item.effect_key === 'hypnosis_phone') {
+      hypnosisPhone.value = { open: true, character: char }
+      pendingItem.value = null
+      return
+    }
     // 小镇货摊买来的道具不是消耗品，是送给角色的礼物：送出后由后端写一段 TA 怎么用它的小故事并配图。
     const isGift = item.source_type === 'trade'
     const effectHint = isGift
@@ -400,6 +411,8 @@ export function useBackpackActions({ confirm, toast }) {
     // 道具使用 / 丢弃
     detailItem, openDetail, startUse, giftStage,
     showCharPicker, pendingItem, cancelPick, pickCharacter,
+    // 催眠手机（effect_key === 'hypnosis_phone' 时改开专用面板）
+    hypnosisPhone,
     onDiscard,
     resetUi,
   }

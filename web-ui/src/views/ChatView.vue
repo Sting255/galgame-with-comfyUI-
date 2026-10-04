@@ -106,6 +106,22 @@
                   loading="lazy"
                 />
               </div>
+              <!-- 等待期占位（专题 §九 建议 1）：淡色 + 复用现成 .typing-dots 跳动圆点（typing 字段终于有人消费）。
+                   必须排在下面 content 分支**之前** —— 占位是有 content 的，否则会被普通气泡吞掉。 -->
+              <div
+                v-else-if="item.msg.placeholder === 'touch'"
+                class="msg-bubble msg-placeholder-bubble"
+              >
+                <span class="msg-placeholder-text">{{ item.msg.content }}</span>
+                <svg class="typing-dots msg-placeholder-dots" viewBox="0 0 72 10" width="36" height="5" aria-hidden="true">
+                  <circle cx="4" cy="5" r="3" class="dot dot-0" />
+                  <circle cx="16" cy="5" r="3" class="dot dot-1" />
+                  <circle cx="28" cy="5" r="3" class="dot dot-2" />
+                  <circle cx="40" cy="5" r="3" class="dot dot-3" />
+                  <circle cx="52" cy="5" r="3" class="dot dot-4" />
+                  <circle cx="64" cy="5" r="3" class="dot dot-5" />
+                </svg>
+              </div>
               <div v-else-if="item.msg.content" class="msg-bubble">
                 <div class="msg-text" v-html="renderContent(item.msg.content)"></div>
               </div>
@@ -158,6 +174,44 @@
         </div>
       </Transition>
 
+      <!-- SLG 动作系统（交互改版 §三）：入口是输入区最右的 ✋ 按钮，点开底部弹层大卡片面板。
+           门控吃服务端（GET .../touch/actions），被拒 toast，反应由后端广播进消息流。
+           详见 script 的 onTouchAction / loadTouchActions。 -->
+      <TouchActionPanel
+        :open="showTouchPanel"
+        :server-groups="touchServerGroups"
+        :state="touchGateState"
+        :busy-actions="touchBusyActions"
+        :hypnosis-badge="touchHypnosisBadge"
+        :pending-count="touchPendingCount"
+        :pending-by-mode="touchPendingByMode"
+        :states="touchStates"
+        @action="onTouchAction"
+        @open="onTouchPanelOpen"
+        @close="showTouchPanel = false"
+      />
+
+      <!-- 玩具面板（独立模块，用户要求）：入口是输入区那颗 🧸 -->
+      <ToyPanel
+        :open="showToyPanel"
+        :worn-toys="wornToys"
+        :toy-options="toyOptions"
+        @close="showToyPanel = false"
+        @toy-equip="onToyEquip"
+        @toy-intensity="onToyIntensity"
+        @toy-remove="onToyRemove"
+        @toy-batch-done="onToyBatchDone"
+      />
+
+      <!-- 性爱交互姿势面板（2026-10-01，用户「性爱的时候可以点击的交互姿势…还得让角色有反馈」）：
+           自包含（面板自己 GET 状态、自己 POST 动作、自己显示反应）；父组件只给角色 id 与显隐。
+           她开始说话由既有消息 SSE 进聊天流；门控拒绝由面板自己 toast 服务端那句人话。 -->
+      <IntimateActionPanel
+        :open="showIntimatePanel"
+        :character-id="chat.activeCharId"
+        @close="showIntimatePanel = false"
+      />
+
       <div class="input-area">
         <div class="force-img-wrap">
           <div
@@ -193,6 +247,62 @@
             ↩ 撤回上一轮对话
           </div>
         </Transition>
+        <!-- ✋ 动作入口（用户裁决「放在最右边」）：紧贴发送按钮左侧 = 图标排最右区段。
+             移动端键盘弹起时与礼物按钮同规则隐藏，别挡输入；pendingCount>0 显示数字角标。 -->
+        <div
+          v-show="!(isMobile && inputFocused)"
+          role="button"
+          tabindex="0"
+          class="touch-icon-btn"
+          :title="touchPendingHint || '动作'"
+          aria-label="动作"
+          @keydown.enter.prevent="showTouchPanel = true"
+          @keydown.space.prevent="showTouchPanel = true"
+          @click="showTouchPanel = true"
+        >
+          <svg viewBox="0 0 24 24" width="20" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6a2 2 0 0 0-4 0v5" /><path d="M14 10V4a2 2 0 0 0-4 0v6" /><path d="M10 10.5V6a2 2 0 0 0-4 0v8" /><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15" /></svg>
+          <span v-if="touchPendingCount > 0" class="touch-icon-badge">{{ touchPendingCount }}</span>
+        </div>
+        <!-- 🧸 玩具入口（用户要求：玩具要有**独立按钮模块**）：与 ✋ 同样式同样例，
+             **未解锁就不渲染**（不是灰按钮）—— 解锁与否只看服务端 GET /toys 的 unlocked。 -->
+        <div
+          v-if="toysEnabled"
+          v-show="!(isMobile && inputFocused)"
+          role="button"
+          tabindex="0"
+          class="touch-icon-btn toy-icon-btn"
+          :class="{ 'is-open': showToyPanel }"
+          :title="showToyPanel ? '收起玩具面板' : (wornToys.length ? '玩具（她正戴着 ' + wornToys.length + ' 件）' : '玩具')"
+          aria-label="玩具"
+          @keydown.enter.prevent="showToyPanel = !showToyPanel"
+          @keydown.space.prevent="showToyPanel = !showToyPanel"
+          @click="showToyPanel = !showToyPanel"
+        >
+          <svg viewBox="0 0 24 24" width="20" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
+            <path d="M5 21c0-3.9 3.1-7 7-7s7 3.1 7 7" />
+          </svg>
+          <span v-if="wornToys.length > 0" class="touch-icon-badge">{{ wornToys.length }}</span>
+        </div>
+        <!-- ❤ 推进入口（2026-10-01）：与 ✋ / 🧸 同款式同样例。
+             不做"未解锁就不渲染"—— 是否进入过亲密场景由面板自己读状态并说明（面板里有明确的门控文案），
+             藏掉入口会让用户以为功能不存在。 -->
+        <div
+          v-show="!(isMobile && inputFocused)"
+          role="button"
+          tabindex="0"
+          class="touch-icon-btn intimate-icon-btn"
+          :class="{ 'is-open': showIntimatePanel }"
+          :title="showIntimatePanel ? '收起推进面板' : '推进（继续抽插 / 加速 / 换姿势）'"
+          aria-label="推进"
+          @keydown.enter.prevent="showIntimatePanel = !showIntimatePanel"
+          @keydown.space.prevent="showIntimatePanel = !showIntimatePanel"
+          @click="showIntimatePanel = !showIntimatePanel"
+        >
+          <svg viewBox="0 0 24 24" width="20" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21.2l7.8-7.8 1-1a5.5 5.5 0 0 0 0-7.8z" />
+          </svg>
+        </div>
         <div role="button" tabindex="0" class="send-btn" :class="{ 'is-disabled': sendDisabled }" :aria-disabled="sendDisabled"
           @keydown.enter.prevent="onSendClick"
           @keydown.space.prevent="onSendClick"
@@ -279,6 +389,18 @@
           查看详细信息
         </div>
 
+        <!-- 亲密信息看板直达：原先要「查看详细信息」→ 详情卡里再点一次，这里一步打开同一个看板 -->
+        <div role="button" tabindex="0" class="sp-btn" @click="openIntimatePanel" @keydown.enter.prevent="openIntimatePanel" @keydown.space.prevent="openIntimatePanel">
+          <svg class="sp-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+          亲密信息
+        </div>
+
+        <!-- 催眠手机直达：不用专程去背包，聊天页一步打开同一个状态面板 -->
+        <div role="button" tabindex="0" class="sp-btn" @click="openHypnosisPanel" @keydown.enter.prevent="openHypnosisPanel" @keydown.space.prevent="openHypnosisPanel">
+          <svg class="sp-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2.5" width="14" height="19" rx="2.5"/><path d="M9.5 2.5v2h5v-2"/><path d="M10 18.5h4"/></svg>
+          催眠手机
+        </div>
+
         <!-- 查看角色对用户的印象 -->
         <div role="button" tabindex="0" class="sp-btn" @click="openImpression" @keydown.enter.prevent="openImpression" @keydown.space.prevent="openImpression">
           <svg class="sp-btn-icon" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg"><path d="M607.839811 895.957102H214.69447A86.82497 86.82497 0 0 1 127.880338 809.070721V214.784781A86.839419 86.839419 0 0 1 214.69447 127.880338h594.28594a86.33729 86.33729 0 0 1 61.436749 25.456857c16.400473 16.400473 25.362934 38.208767 25.373771 61.411462L894.439878 607.821749v0.10476a32.031496 32.031496 0 0 0 64.059379 0.101149L959.825022 214.889542v-0.104761A150.775976 150.775976 0 0 0 808.98041 63.940169H214.69447A150.638703 150.638703 0 0 0 63.940169 214.784781v594.28594a150.638703 150.638703 0 0 0 150.757914 150.82655h393.141728a31.970084 31.970084 0 0 0 0-63.940169z" fill="currentColor"/><path d="M950.544667 905.331381l-122.071536-122.071536a192.217875 192.217875 0 1 0-45.213286 45.213286l122.071536 122.071536a31.970084 31.970084 0 0 1 45.213286-45.213286z m-278.547941-105.302594a128.028448 128.028448 0 1 1 90.531332-37.497116 127.193975 127.193975 0 0 1-90.527719 37.497116zM768.004516 352.212795c17.653989 0 31.966472-14.402794 31.970084-32.056783s-14.308871-32.074845-31.966472-32.078457L256.002709 287.911382a32.020659 32.020659 0 0 0-31.970084 32.024271c0 17.657601 14.308871 32.092907 31.966472 32.092908L768.004516 352.212795zM448.000226 544.033302a31.96286 31.96286 0 1 0 0-63.940169h-192.001129a31.937573 31.937573 0 1 0 0 63.878758l192.001129 0.061411zM256.017159 671.91364a31.959247 31.959247 0 1 0 0 63.922107l127.999549 0.018062a31.941185 31.941185 0 1 0 0-63.878757z" fill="currentColor"/></svg>
@@ -333,6 +455,22 @@
       :all-characters="chat.characters"
       @close="showRelationGraph = false"
     />
+
+    <!-- 亲密信息看板（聊天页直达入口）：与角色详情卡内那份是同一个组件、同一套标题与底部操作 -->
+    <linshe-modal v-model="showIntimate" :title="`亲密信息 — ${chat.activeChar?.display_name || ''}`" full>
+      <IntimatePanel v-if="chat.activeChar" :character="chat.activeChar" />
+      <template #footer>
+        <linshe-button variant="secondary" @click="showIntimate = false">关闭</linshe-button>
+      </template>
+    </linshe-modal>
+
+    <!-- 催眠手机（聊天页直达入口）：与背包入口是同一个面板组件；持有/门控由面板自行提示（含领取按钮） -->
+    <linshe-modal v-model="showHypnosis" :title="`催眠手机 — ${chat.activeChar?.display_name || ''}`" full>
+      <HypnosisPhonePanel v-if="chat.activeChar && showHypnosis" :character="chat.activeChar" />
+      <template #footer>
+        <linshe-button variant="secondary" @click="showHypnosis = false">关闭</linshe-button>
+      </template>
+    </linshe-modal>
 
     <!-- 角色对用户的印象弹窗 -->
     <Transition name="editor-fade">
@@ -590,9 +728,18 @@ import ChatBgPanel from '../components/ChatBgPanel.vue'
 import RelationshipGraph from '../components/RelationshipGraph.vue'
 import CharacterDetailModal from '../components/CharacterDetailModal.vue'
 import GiftPanel from '../components/GiftPanel.vue'
+import TouchActionPanel from '../components/TouchActionPanel.vue'
+import ToyPanel from '../components/ToyPanel.vue'
+// 性爱交互姿势面板（2026-10-01，task-1）：自包含（自己读状态、自己发动作），父组件只持显隐
+import IntimateActionPanel from '../components/IntimateActionPanel.vue'
+import { buildGroupsFromServer, createCoalescer, hypnosisBadgeOf, pendingHintByMode } from '../components/touchActionLogic.js'
+import { getHypnosisState } from '../api/hypnosis.js'
 import ImageLightbox from '../components/ImageLightbox.vue'
 import LinsheButton from '../components/ui/LinsheButton.vue'
 import LinsheSwitch from '../components/ui/LinsheSwitch.vue'
+import LinsheModal from '../components/ui/LinsheModal.vue'
+import IntimatePanel from '../components/character/IntimatePanel.vue'
+import HypnosisPhonePanel from '../components/HypnosisPhonePanel.vue'
 import { userAvatar, loadUserAvatar } from '../userConfig.js'
 import * as api from '../api/index.js'
 import { openStandingDisplay, standingDisplayUrl, selectStandingCharacter } from '../utils/standingDisplay.js'
@@ -681,6 +828,226 @@ const isCharSleeping = computed(() => {
   const s = charSleepState.value
   return s ? (s.is_sleeping && !s.is_temp_woken) : false
 })
+
+// ── SLG 动作系统（阶段一·前端）：私聊动作条（task-15 接线）──
+// **门控以服务端为准**：GET /api/characters/:id/touch/actions 里逐 key 的 gate 就是 getTouchGate
+// 的真实结果（含催眠豁免、Lv3 亲密看板授权），前端零翻译、零自算。
+// 下面的 touchGateState 只是**端点不可用时的镜像兜底**（见 docs/touch-system.md §6.3 / §4）。
+const touchServerGroups = ref([])
+
+async function loadTouchActions() {
+  const charId = chat.activeCharId
+  if (!charId) { touchServerGroups.value = []; return }
+  try {
+    const payload = await api.fetchTouchActions(charId, { scene: 'chat' })
+    // 拉取期间可能已切换角色：丢弃过期响应
+    if (chat.activeCharId !== charId) return
+    touchServerGroups.value = buildGroupsFromServer(payload)
+  } catch (err) {
+    // 端点不可用 → 清空，组件自动回落到镜像门控，功能不至于全废
+    console.warn('[touch] 动作清单拉取失败，回落镜像门控:', err?.message || err)
+    touchServerGroups.value = []
+  }
+}
+
+// ── 待回应条数（task-25 ③；task-29 问题 3 补「被消费后刷新」）──
+// 数据：GET .../touch/state 的 pendingCount —— 动作做下、还等着她回应的条数。
+// 读不到 / 非数字一律当 0（不显示提示行、不弹错）。
+const touchPendingCount = ref(0)
+/** 分模式待回应数（专题 §七 问题 3；后端未落地时为空对象 → 文案回落） */
+const touchPendingByMode = ref({})
+/** 入口角标标题 / 面板提示行同源文案 */
+const touchPendingHint = computed(() => pendingHintByMode({ count: touchPendingCount.value, byMode: touchPendingByMode.value }))
+/** 动作面板显隐（✋ 入口点开） */
+const showTouchPanel = ref(false)
+/** 每动作的耐受 / 偏好（GET /touch/state 的 states）→ 面板卡片状态行与偏好角标 */
+const touchStates = ref({})
+
+// ── 玩具系统（2026-09-30 三期，契约见 docs/toys.md）────────────────────────────
+// 门控**一律服务端说了算**（gate.allowed / gate.message 原样吃），前端不算门槛；
+// 未解锁或端点不可用 ⇒ 整块不渲染（不伪造数据）。修复真机反馈：之前父组件漏传这两个 prop、
+// 也漏接三个事件 ⇒ 面板玩具区永远不出现。
+const showToyPanel = ref(false)
+// 性爱交互姿势面板显隐（入口是输入区那颗 ❤；面板自包含状态与请求）
+const showIntimatePanel = ref(false)
+const toysEnabled = ref(false)
+const wornToys = ref([])
+/**
+ * 背包可选项（服务端下发，带逐件 gate）。
+ * 2026-10-01 修：原来**没把服务端清单传给面板**，ToyPanel 就回落到前端镜像
+ * （`toy.js` 里写死 `gate:{allowed:true}`）—— 结果是服务端会拒的玩具在面板上照样是"亮"的，
+ * 点下去只吃到 403 错误 toast，而不是服务端那句剧情文案；「门控服务端说了算」在这个面板上等于没落地。
+ */
+const toyOptions = ref([])
+
+async function loadToys() {
+  const charId = chat.activeCharId
+  if (!charId) { toysEnabled.value = false; wornToys.value = []; toyOptions.value = []; return }
+  try {
+    const res = await api.fetchToys(charId)
+    if (chat.activeCharId !== charId) return          // 期间换了角色：丢弃过期响应
+    toysEnabled.value = res?.unlocked === true
+    wornToys.value = Array.isArray(res?.worn) ? res.worn : []
+    toyOptions.value = Array.isArray(res?.available) ? res.available : []
+  } catch {
+    toysEnabled.value = false
+    wornToys.value = []
+    toyOptions.value = []
+  }
+}
+
+/** 面板打开：门控/腻烦度可能变了，玩具状态也一起刷新 */
+// ── 催眠状态徽标（复审遗留 2）──
+// **状态一律服务端说了算**：读 GET /characters/:id/hypnosis 的 { active, mindAwake }，
+// 前端不做任何本地推断；取不到 / 形状不对 ⇒ null（面板不渲染，绝不默认「完全控制」）。
+const touchHypnosisBadge = ref(null)
+async function loadTouchHypnosis() {
+  const charId = chat.activeCharId
+  if (!charId) { touchHypnosisBadge.value = null; return }
+  try {
+    const st = await getHypnosisState(charId)
+    if (charId !== chat.activeCharId) return   // 过期响应丢弃（切角色了）
+    touchHypnosisBadge.value = hypnosisBadgeOf(st)
+  } catch {
+    touchHypnosisBadge.value = null   // 取不到就不显示，绝不猜
+  }
+}
+
+function onTouchPanelOpen() { loadTouchActions(); loadToys(); loadTouchHypnosis() }
+
+async function onToyEquip(toyKey) {
+  const charId = chat.activeCharId
+  if (!charId) return
+  try {
+    const res = await api.equipToy(charId, toyKey, { intensity: 1 })
+    toastFn?.(res?.toy?.label ? `已给她戴上：${res.toy.label}` : '已经戴上了', 'info')
+    await loadToys()
+  } catch (err) {
+    toastFn?.(err?.message || '没戴上', 'error')   // 门控被拒时后端会带人话文案
+  }
+}
+
+async function onToyIntensity({ toyKey, intensity } = {}) {
+  const charId = chat.activeCharId
+  if (!charId || !toyKey) return
+  try {
+    await api.setToyIntensity(charId, toyKey, intensity)
+    await loadToys()
+  } catch (err) { toastFn?.(err?.message || '强度没调成', 'error') }
+}
+
+async function onToyRemove(toyKey) {
+  const charId = chat.activeCharId
+  if (!charId) return
+  try {
+    await api.removeToy(charId, toyKey)
+    await loadToys()
+  } catch (err) { toastFn?.(err?.message || '没摘下来', 'error') }
+}
+
+/**
+ * 批量装卸完成后**只做一件事**：重取玩具清单。
+ *
+ * 面板自己已经刷新过了（它有自己的 `refresh()`）；这里刷新的是**父组件的** `wornToys` ——
+ * 右下角那颗 🧸 上的红色数字角标（`v-if="wornToys.length > 0"`）读的就是它。
+ *
+ * 2026-10-04 用户反馈：「清空是清空了，但是右下角的红色数字角标还是继续在」——
+ * 根因就是批量走的是"面板直接 POST"，父组件毫不知情；单件那三条 emit 之所以没这问题，
+ * 是因为它们本来就经过父组件。所以批量必须**补一条回执 emit**（`toy-batch-done`）。
+ *
+ * 反应消息（她的一句话）由**服务端**在批量端点里发布，不走这里 —— 前端只补父组件那份状态。
+ */
+async function onToyBatchDone() {
+  await loadToys()
+}
+
+async function loadTouchState() {
+  const charId = chat.activeCharId
+  if (!charId) { touchPendingCount.value = 0; touchStates.value = {}; return }
+  try {
+    const payload = await api.fetchTouchState(charId)
+    if (chat.activeCharId !== charId) return          // 期间换了角色：丢弃过期响应
+    const raw = Number(payload && payload.pendingCount) || 0
+    touchPendingCount.value = raw > 0 ? Math.floor(raw) : 0
+    // 卡片状态行（耐受档 / 偏好角标）吃 states；缺字段就空着，不影响可用性
+    touchStates.value = payload && payload.states && typeof payload.states === 'object' ? payload.states : {}
+  } catch (err) {
+    // 端点不可用：这只是个提示，静默归零，别打断主流程
+    touchPendingCount.value = 0
+    touchStates.value = {}
+  }
+}
+
+// 她回应那一轮会连续插好几条消息（见下面 messages.length 监听）——合并成一次刷新，别把请求打爆
+const touchStateCoalescer = createCoalescer({ run: () => { loadTouchState() } })
+function scheduleTouchStateRefresh() { touchStateCoalescer.schedule() }
+
+// 切角色时重拉；展开动作条时也会再刷（见模板 @open）——门控依赖好感 / 睡眠 / 誓约，会变
+// task-29：顺带取消上一轮待合并的刷新（别让上一个角色的响应落到新角色头上），并立刻重拉条数
+// 2026-10-01：`loadToys()` 也挂进来（immediate ⇒ 初次进页面就跑）。原来它只在「点开 ✋ 动作面板」
+// 和装卸玩具之后被调用 ⇒ **冷启动 / 换角色时 🧸 入口根本不渲染**（`v-if="toysEnabled"` 还是 false），
+// 用户必须先开一次 ✋ 才看得到玩具入口。
+watch(() => chat.activeCharId, () => {
+  touchStateCoalescer.cancel()
+  loadTouchActions()
+  loadTouchState()
+  loadToys()
+}, { immediate: true })
+
+// 镜像门控入参：与服务层 getTouchGate 同名。**仅在服务端不可用时生效**
+// （intimateAuthorized / hypnotized 前端没有独立来源，兜底路径按保守值处理）
+const touchGateState = computed(() => ({
+  affinity: impressionAffinity.value,
+  isOath: !!chat.activeChar?.is_oath,
+  sleeping: isCharSleeping.value,
+  scene: 'chat',
+  intimateAuthorized: false,
+  hypnotized: false,
+}))
+
+// 正在上报的动作 key：请求期间该胶囊转 loading，并忽略连点
+// §4.2 连点：**同动作在飞时忽略重复点击、不同动作可并发** ⇒ 单个 key 换成 Set
+const touchBusyActions = ref(new Set())
+
+async function onTouchAction(actionId) {
+  const charId = chat.activeCharId
+  if (!charId || !actionId || touchBusyActions.value.has(actionId)) return
+  touchBusyActions.value = new Set(touchBusyActions.value).add(actionId)
+  // 建议 2（专题 §九）：**乐观插入占位** —— 覆盖 0~3 秒的 POST 等待期。
+  // （之前放在 await 之后：卡片转 3 秒 spinner 占位才出现，它自己没赶上要盖的静默期。）
+  // 门控拒绝 / 异常 / 隐式模式在下面立刻撤；真消息到达由 store 自己撤；15s 超时兜底。
+  chat.showTouchPlaceholder?.()
+  try {
+    const res = await api.performTouchAction(charId, actionId, { scene: 'chat' })
+
+    // 门控拒绝 = **200 + { allowed:false, code, message }**（“她不愿意”是叙事结果，不是请求失败）
+    // → 撤占位 + 直接 toast 服务端那句人话；**绝不伪造她的反应**
+    if (!res || res.allowed !== true) {
+      chat.clearTouchPlaceholder?.()   // 被拒：她不会有反应，占位不能留着
+      if (res?.message) toastFn?.(res.message, 'info')
+      return
+    }
+    // 真机反馈问题 2：她开始说话了，面板让位（隐式模式这轮没反应 ⇒ 留着让用户接着来）
+    // §4.2：「成功后自动收起」**作废**（§七那条被推翻）—— 面板常驻，用户要连着摸、连点。
+    // 隐式模式这轮她不会立刻反应 ⇒ 撤占位（否则误导）；非隐式留着占位，等真消息到达由 store 撤。
+    if (res.mode === 'implicit') chat.clearTouchPlaceholder?.()
+    if (res.notice) toastFn?.(res.notice, 'info')
+    else if (res.mode === 'implicit') toastFn?.('她的反应会在你下次发言时出现', 'info')
+
+    // 即时反应后端已 writeProactiveMessage 落库 + broadcastProactiveMessage 广播：
+    // 本页既有链路（App.vue → chat.handleProactiveMessage）会把它当作「她的新消息」插进消息流。
+    // 所以这里**不手动渲染、不重复插入**（免得与广播打架，也符合「别另造一套」）。
+  } catch (err) {
+    // 400 非法 action / 404 角色不存在 / 409 动作系统已关闭
+    chat.clearTouchPlaceholder?.()   // 异常路径：占位绝不残留（超时兜底之外的第一道）
+    toastFn?.(err?.message || '动作失败', 'error')
+  } finally {
+    touchBusyActions.value.delete(actionId)
+    loadTouchActions()   // 门控 / 腻烦度可能变了，刷新一次
+    loadTouchState()     // 待回应条数也变了（task-25 ③）
+  }
+}
+
 const imageGenMode = computed(() => settings.imageGenMode)
 const imageGenModeLabel = computed(() => {
   if (imageGenMode.value === 'off') return '关闭配图'
@@ -899,6 +1266,9 @@ function onChatImageRegenerated(newUrl) {
 
 // ── 角色设置面板 ──
 const showSettings = ref(false)
+/** 亲密看板（聊天页直达）：与角色详情卡里那个是同在 IntimatePanel 上的同一个看板 */
+const showIntimate = ref(false)
+const showHypnosis = ref(false)
 const showEditor = ref(false)
 const showRelationGraph = ref(false)
 const detailModalRef = ref(null)
@@ -1253,6 +1623,21 @@ function msgAvatarSrc(role) {
 function openSettings() { showSettings.value = true }
 function closeSettings() { showSettings.value = false }
 
+/**
+ * 从聊天页设置面板一步打开亲密信息看板。
+ * 先关设置面板再开看板：两者都是遮罩层，叠着会出现两层遮罩与焦点错乱。
+ */
+function openIntimatePanel() {
+  showSettings.value = false
+  showIntimate.value = true
+}
+
+/** 从聊天页设置面板一步打开催眠手机（与亲密信息同款交互：先关设置面板，避免双层遮罩） */
+function openHypnosisPanel() {
+  showSettings.value = false
+  showHypnosis.value = true
+}
+
 // ══════════════════════════════════════════════════
 // 角色详情编辑弹窗（酒馆同款）
 // ══════════════════════════════════════════════════
@@ -1598,6 +1983,9 @@ watch(() => chat.activeCharId, (id, oldId) => {
 // 新消息到达 → 自动滚底（监听 messages.length，窗口展开不影响）
 watch(() => chat.messages.length, (newLen) => {
   if (newLen === 0) return
+  // task-29 问题 3：新消息往往就是「她回应了」⇒ 把「还有 N 个动作」刷掉。
+  // 走合并器：同一轮会连插好几条，只刷一次，别把请求打爆。
+  scheduleTouchStateRefresh()
   if (pendingCharSwitch) {
     // 切角色后消息加载完成：滚底 + 恢复可见
     setTimeout(() => {
@@ -1856,6 +2244,15 @@ function renderContent(text) {
 }
 
 /* 打字指示器：6 个圆点依次变色的 wave 动画 */
+/* 等待期占位气泡（专题 §九 建议 1）：淡色 + 呼吸动画，圆点复用现成 .typing-dots（跳动的 keyframes 已有） */
+.msg-placeholder-bubble {
+  display: inline-flex; align-items: center; gap: 8px;
+  animation: placeholder-breathe 1.6s ease-in-out infinite;
+}
+.msg-placeholder-text { color: var(--text-secondary); font-style: italic; }
+.msg-placeholder-dots { opacity: 0.85; }
+@keyframes placeholder-breathe { 0%, 100% { opacity: 0.55 } 50% { opacity: 0.85 } }
+
 .typing-dots { overflow: visible; flex-shrink: 0; }
 .typing-dots .dot {
   fill: #fff; animation: dotBlink 1.2s ease-in-out infinite;
@@ -2041,6 +2438,43 @@ function renderContent(text) {
 .gift-btn:hover { transform: scale(1.08); box-shadow: 0 4px 16px rgba(249, 194, 112, 0.35); }
 .gift-btn:hover .gift-btn-icon { transform: rotate(12deg) scale(1.1); }
 .gift-btn:active { transform: scale(0.94); }
+
+/* ── ✋ 动作入口：与礼物按钮同尺寸同位置语言（输入区图标排最右，紧贴发送） ── */
+.touch-icon-btn {
+  position: relative;
+  width: 42px; height: 42px; flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--accent);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  user-select: none;
+}
+.touch-icon-btn:hover { transform: scale(1.08); border-color: var(--accent); box-shadow: 0 4px 16px rgba(var(--accent-rgb), 0.25); }
+.touch-icon-btn:active { transform: scale(0.94); }
+.touch-icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* 面板开着时按钮高亮（2026-10-02 用户反馈："点开面板后只能点右上角的 × 关掉"）：
+   入口现在自己就是开关，所以它必须让人一眼看出"面板是我开着的、再点一下就收"。
+   渐变 + 0.3s 过渡，与设计系统的其它状态变化同节奏。 */
+.touch-icon-btn.is-open {
+  background: linear-gradient(135deg, var(--accent), rgba(var(--accent-rgb), 0.72));
+  border-color: var(--accent);
+  color: #fff;
+  box-shadow: 0 2px 12px rgba(var(--accent-rgb), 0.32);
+  transition: background 0.3s cubic-bezier(0.4, 0, 0.2, 1), color 0.3s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+/* 待回应角标：pendingCount>0 才出现 */
+.touch-icon-badge {
+  position: absolute; top: -3px; right: -3px;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent); color: #fff;
+  font-size: 10px; line-height: 16px; font-weight: 600;
+  text-align: center;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+}
 
 /* ── 叫醒按钮（覆盖送礼按钮样式） ── */
 .wake-btn {

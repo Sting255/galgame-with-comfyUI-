@@ -16,12 +16,18 @@
       :mobile-open="mobileSidebarOpen"
       @char-selected="closeMobileSidebar"
     />
-    <div class="page-host">
+    <div class="page-host" :class="contextPanelClass">
+      <!-- 全局左上角上下文用量浮层：放在 .page-host 内，位置基准是内容区而非视口，
+           因此不会压到 NavBar / Sidebar 的可点区域，切页面也不消失。
+           各页面自带的标题栏高度不同，用一个变量把浮层的起始纵坐标让出来（见下方样式）。 -->
+      <ContextUsagePanel />
       <router-view v-slot="{ Component }">
         <Transition name="page">
           <component v-if="Component" :is="Component" :key="route.path" />
         </Transition>
       </router-view>
+      <!-- 页面弹窗独立挂载，避免 Teleport 锚点成为路由页面切换时的插入参照。 -->
+      <div class="page-modal-host"></div>
     </div>
   </div>
   <ConfirmDialog ref="confirmDialog" />
@@ -39,7 +45,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, provide, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { createMobileSidebarBackHandler } from './utils/mobileSidebarBack.js'
 import { useChatStore } from './stores/chat.js'
@@ -51,6 +57,8 @@ import { playNotificationSound } from './utils/sound.js'
 import { useMailboxStore } from './stores/mailbox.js'
 import { useUpdateStore } from './stores/updateInfo.js'
 import { onEvent as onStreamEvent } from './stores/unifiedStream.js'
+import { getProgramTime } from './api/timeControl.js'
+import { programTimeViewModel } from './components/timeControlLogic.js'
 import NavBar from './components/NavBar.vue'
 import Sidebar from './components/Sidebar.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
@@ -58,6 +66,7 @@ import Toast from './components/Toast.vue'
 import InstallGuideDialog from './components/InstallGuideDialog.vue'
 import ChangelogDialog from './components/ChangelogDialog.vue'
 import ImageEditTaskFloater from './components/ImageEditTaskFloater.vue'
+import ContextUsagePanel from './components/ContextUsagePanel.vue'
 import { MAIBOT_AFTER_START_STEPS, MAIBOT_INSTALL_STEPS, MAIBOT_INTRO_TEXT } from './data/maibotTutorial.js'
 import { CHANGELOG_FLAG } from './data/changelog.js'
 
@@ -67,6 +76,14 @@ const proactive = useProactiveStore()
 const mailbox = useMailboxStore()
 const update = useUpdateStore()
 const route = useRoute()
+// ── 上下文用量浮层的纵向基准 ──
+// 浮层固定在内容区左上角，必须让开各页面自己的标题栏，否则会盖住
+// 返回按钮 / 页面标题这些可点区域。聊天页标题栏是固定高度（桌面 64px、手机 68px），
+// 其余页面标题栏多为内联流式（高度随内容），用 60px 这个保守值都能落在标题栏下方。
+const CHAT_ROUTES = ['/chat', '/group']
+const contextPanelClass = computed(() => (
+  CHAT_ROUTES.some(prefix => route.path.startsWith(prefix)) ? 'is-chat-route' : ''
+))
 const confirmDialog = ref(null)
 const toastEl = ref(null)
 const guideDialog = ref(null)
@@ -105,12 +122,31 @@ function toast(message, type = 'info', duration) {
   toastEl.value?.show(message, type, duration)
 }
 
-/** 目标日期的口语化描述：明天 / 后天 / 大后天，再往后显示 M月D日 */
-function describeTargetDate(dateKey) {
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
+/**
+ * 程序世界的「今天」（日期键 YYYY-MM-DD）。
+ *
+ * 2026-10-02 修：日程的 `target_date` 与 `daily_schedules.schedule_date` 都是**程序日期键**，
+ * 原来这里拿 `new Date()`（真实今天）去比，世界钟被拨过之后「明天 / 后天」会指错天。
+ * 前端**不自己算偏移**：只读后端 `GET /api/time` 的 `date`；读不到给空串（那时不做相对日期判断）。
+ */
+async function programDateKeyNow() {
+  try {
+    const view = programTimeViewModel(await getProgramTime())
+    return view.date || ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 目标日期的口语化描述：明天 / 后天 / 大后天，再往后（或判断不了）显示 M月D日。
+ * 基准 `todayKey` 是**程序世界的今天**；拿不到时不做"明天/后天"的相对判断，宁可少说也不说错。
+ */
+function describeTargetDate(dateKey, todayKey = '') {
   const target = new Date(`${dateKey}T00:00:00`)
-  const diffDays = Math.round((target - today) / 86400000)
+  if (Number.isNaN(target.getTime())) return dateKey
+  const base = /^\d{4}-\d{2}-\d{2}$/.test(String(todayKey)) ? new Date(`${todayKey}T00:00:00`) : null
+  const diffDays = base ? Math.round((target - base) / 86400000) : null
   if (diffDays === 1) return '明天'
   if (diffDays === 2) return '后天'
   if (diffDays === 3) return '大后天'
@@ -222,6 +258,12 @@ onMounted(async () => {
     }
   })
 
+  // 私聊两段式反应的**后半段**（专题 §八 8.2）：她的文字反应先上屏，图好了再补到那条气泡上。
+  // payload（后端定，未落地前按此写）：{ msg_id, raw_id, images }；找不到 msg_id 会安全忽略。
+  onStreamEvent('proactive_message_update', (data) => {
+    chat.handleProactiveMessageUpdate(data)
+  })
+
   // 订阅日程延迟回复 SSE 事件
   onStreamEvent('delayed_reply', (data) => {
     chat.handleDelayedReply(data)
@@ -233,11 +275,12 @@ onMounted(async () => {
   })
 
   // 日程更改成功（手动编辑 / 聊天约定 / 跨天约定应用）→ 右上角提示
-  onStreamEvent('schedule_changed', (data) => {
+  onStreamEvent('schedule_changed', async (data) => {
     const name = data.display_name || '角色'
-    const todayKey = new Date().toLocaleDateString('sv-SE') // 本地时区 YYYY-MM-DD
+    // 基准是**程序世界的今天**（日程日期键属于世界钟；不拿现实日期冒充，也不在前端算偏移）
+    const todayKey = await programDateKeyNow()
     if (data.target_date && data.target_date !== todayKey) {
-      toast(`「${name}」的约定已排入${describeTargetDate(data.target_date)}的日程`, 'success')
+      toast(`「${name}」的约定已排入${describeTargetDate(data.target_date, todayKey)}的日程`, 'success')
     } else {
       toast(`「${name}」日程已更新`, 'success')
     }
@@ -297,7 +340,22 @@ onUnmounted(() => {
 
 <style>
 .app-layout { display: flex; flex: 1; min-height: 0; position: relative; z-index: 1; }
-.page-host { position: relative; flex: 1; min-width: 0; }
+.page-modal-host { position: absolute; inset: 0; pointer-events: none; }
+.page-modal-host .modal-overlay { pointer-events: auto; }
+.page-host {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  /* 上下文用量浮层（ContextUsagePanel）的纵向起点：让开当前页面的标题栏。
+     聊天页标题栏是固定高度（桌面 64px），其余页面是内联流式标题，60px 是通用保守值。 */
+  --ctx-usage-top: 60px;
+}
+.page-host.is-chat-route { --ctx-usage-top: 64px; }
+@media (max-width: 767px) {
+  /* 手机端聊天页有 44px 的返回按钮，标题栏更高 */
+  .page-host.is-chat-route { --ctx-usage-top: 68px; }
+  .page-host { --ctx-usage-top: 58px; }
+}
 #app { position: relative; z-index: 1; }
 
 /* ── 移动端 Sidebar 遮罩 ── */

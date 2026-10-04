@@ -51,3 +51,21 @@ HyperFrames/
 krea2-posters/
 
 # Isolated M1 UI build (screenshots and verification report remain reviewable)
+
+# 完整包输出目录（整包 7z 产物，数百 MB 级，绝不入库）
+完整/
+
+# 发布产物：scripts/build-release.mjs 每次发布会生成同名文件进 release 目录，
+# 仓库内无代码读取根目录这份（内容与脚本生成的一致），按发布产物处理
+使用说明.txt
+
+# ???????logs/backend-YYYY-MM-DD.log?????????
+logs/
+
+# 一键导出的备份归档（默认落在仓库根目录，单个 100 MB 级，且**含用户真实 agent.db 与头像**）
+# 2026-10-01：`linshe-backup-20260930-1405.tar.gz`（103 MiB）曾被 `git add -A` 误扫进库
+# （那个提交的信息写的是 touch UI 修复），成了整个对象库里最大的 blob。已 `git rm --cached` 取消跟踪，
+# 并在此拦住以后同类文件。**文件本身留在磁盘上**——那是用户的备份，不是垃圾。
+/linshe-backup-*.tar.gz
+/linshe-backup-*.tar.gz.*
+

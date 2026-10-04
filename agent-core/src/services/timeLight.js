@@ -8,6 +8,21 @@
 
 import { getDb } from '../db/index.js';
 import { config } from '../config.js';
+import { getProgramNow, toProgramTime } from './programTime.js';
+
+/**
+ * 时间入参归一：本模块所有导出的 `now` 参数都按这个口径解释。
+ *   · 不传        → **程序时间**（真实时间 + 程序时间偏移）—— 默认路径
+ *   · `Date`      → 视为**真实时间**，内部加上偏移（chat.js / moments / eventGenerator 都传 new Date()）
+ *   · 其它对象    → 原样透传（小镇模拟传的是 `{ getHours, getMinutes }` 这种鸭子类型时钟，
+ *                   它有自己的世界钟，不能在这里再偏移一次）
+ * 偏移为 0（默认）时三种情况都与改动前逐字节一致。
+ */
+function resolveNow(now) {
+  if (now === undefined || now === null) return getProgramNow();
+  if (now instanceof Date) return toProgramTime(now);
+  return now;
+}
 
 const LIGHT_MAP = [
   // [时间范围], 时段名, 无天气全量描述（室外+室内）, 有天气时仅室内描述
@@ -32,6 +47,10 @@ const LIGHT_MAP = [
 // 天气→光线修饰。QWeather v7 天气文本 → 对画面光线的影响描述。
 const WEATHER_LIGHT_MOD = {
   '晴': '阳光充足、光影分明、色调偏暖',
+  // 2026-10-01：夜间的「晴」（见 getCurrentWeather 里的夜间改写）。不加这条的话，
+  // 晴朗夜晚被改写成「月朗星稀」之后 `_normalizeWeather` 归一到它、表里却没有，
+  // 光线修饰词会直接从「阳光充足…」变成**空串** —— 等于修好一个文案、弄丢另一个。
+  '月朗星稀': '夜色清朗、月色分明、星光微弱',
   '少云': '阳光充足、有少量云影',
   '晴间多云': '阳光与云影交替、光线多变',
   '多云': '云层较多、厚薄不一，光线柔和偏散，阴影较淡',
@@ -98,7 +117,14 @@ export function getCurrentWeather(hour) {
       'SELECT weather_text, temperature, wind_speed FROM weather_hourly WHERE weather_time = ?'
     ).get(timeStr);
     if (!row) return null;
-    return { weather: row.weather_text, temperature: row.temperature, windSpeed: row.wind_speed };
+    // 2026-10-01：夜间改写**从 weatherService 搬到这里**（单一真源）。
+    // 原来只有 `weatherService.getWeatherContext → getCurrentWeather` 那条链做这件事，
+    // 而那四个函数全树零调用点 ⇒ 夜里「晴」永远不会变成「月朗星稀」，
+    // 所有角色在晴朗夜晚抬头看天都只会说「晴」。这里才是真正在跑的那条链
+    // （getTimeLight / getTimeTag / getLightHint / getWeatherLightNote 都吃它）。
+    const isNight = hour >= 18 || hour < 6;
+    const weather = (isNight && row.weather_text === '晴') ? '月朗星稀' : row.weather_text;
+    return { weather, temperature: row.temperature, windSpeed: row.wind_speed };
   } catch {
     return null;
   }
@@ -140,8 +166,9 @@ export function getWeatherClause(hour) {
  * @param {Date} [now]
  * @returns {string}
  */
-export function getTimeLightInline(now = new Date()) {
-  const { timeStr, timeDesc, lightNote, lightNoteIndoor, hour } = getTimeLight(now);
+export function getTimeLightInline(now) {
+  now = resolveNow(now);
+  const { timeStr, timeDesc, lightNote, lightNoteIndoor, hour } = pickTimeLight(now); // 已在上方 resolveNow 过，这里不能再 resolve（否则偏移加两遍）
   const season = getSeason(now.getMonth() + 1);
   const weather = getCurrentWeather(hour);
   if (weather && weather.weather) {
@@ -150,9 +177,9 @@ export function getTimeLightInline(now = new Date()) {
     if (weather.temperature) parts.push(weather.temperature);
     if (weather.windSpeed) parts.push(weather.windSpeed);
     if (weatherLight) parts.push(weatherLight);
-    return `现在是${timeStr}，${season}日的${timeDesc}时分。外面${parts.join('、')}。${lightNoteIndoor}`;
+    return `现在是${timeStr}，${season}的${timeDesc}时分。外面${parts.join('、')}。${lightNoteIndoor}`;
   }
-  return `现在是${timeStr}，${season}日的${timeDesc}时分。${lightNote}`;
+  return `现在是${timeStr}，${season}的${timeDesc}时分。${lightNote}`;
 }
 
 /**
@@ -161,8 +188,9 @@ export function getTimeLightInline(now = new Date()) {
  * @param {Date} [now]
  * @returns {string}
  */
-export function getLightNoteWithWeather(now = new Date()) {
-  const { lightNoteIndoor, hour } = getTimeLight(now);
+export function getLightNoteWithWeather(now) {
+  now = resolveNow(now);
+  const { lightNoteIndoor, hour } = pickTimeLight(now); // 已在上方 resolveNow 过，这里不能再 resolve（否则偏移加两遍）
   const weather = getCurrentWeather(hour);
   if (!weather || !weather.weather) return '';
   const weatherLight = getWeatherLightNote(hour);
@@ -174,17 +202,39 @@ export function getLightNoteWithWeather(now = new Date()) {
 }
 
 /**
+ * ⚠️ 2026-10-01 修掉一类**双重偏移** bug（用户："角色感受到的时间很混乱"）：
+ *
+ * `resolveNow()` 对真实瞬间会 `toProgramTime()`（加一次偏移），但对**已经是程序时间**的 Date
+ * 无法识别，还会再加一次。而本文件里每个"非叶子"函数原来都是
+ * `now = resolveNow(now)` → `getTimeLight(now)`，而 `getTimeLight` 内部**也会 resolve** ⇒
+ * 偏移被加两遍：**日期/时刻串用的是加一遍的值，时段标签与天气钟点用的是加两遍的值**。
+ *
+ * 真实日志证据（用户程序时间拨快 13h17m 后）：
+ *   `[2026-10-02 周五 08:56 | 秋天·深夜]` —— 08:56 + 13h17m = 22:13 ⇒ 落在 LIGHT_MAP 的「深夜」，
+ *   而同一行前面的 `08:56` 是只加一遍的正确值。角色于是"早上八点"被喂成"深夜"。
+ *
+ * 修法：**resolve 只做一次**，之后一律走不做解析的纯函数 `pickTimeLight(date)`。
+ * 公共 API 形状不变（外部仍传真实瞬间或什么都不传）。
+ */
+function pickTimeLight(date) {
+  const hour = date.getHours();
+  const timeStr = `${String(hour).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+  const entry = LIGHT_MAP.find(([r]) => hour >= r[0] && hour < r[1]);
+  return {
+    timeStr,
+    hour,
+    timeDesc: entry?.[1] || '未知',
+    lightNote: entry?.[2] || 'natural lighting',
+    lightNoteIndoor: entry?.[3] || '室内场景以灯光为主',
+  };
+}
+
+/**
  * @param {Date} [now]
  * @returns {{ timeStr: string, timeDesc: string, lightNote: string, lightNoteIndoor: string, hour: number }}
  */
-export function getTimeLight(now = new Date()) {
-  const hour = now.getHours();
-  const timeStr = `${String(hour).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-  const entry = LIGHT_MAP.find(([r]) => hour >= r[0] && hour < r[1]);
-  const timeDesc = entry?.[1] || '未知';
-  const lightNote = entry?.[2] || 'natural lighting';
-  const lightNoteIndoor = entry?.[3] || '室内场景以灯光为主';
-  return { timeStr, timeDesc, lightNote, lightNoteIndoor, hour };
+export function getTimeLight(now) {
+  return pickTimeLight(resolveNow(now));
 }
 
 /**
@@ -196,11 +246,11 @@ export function getTimeLight(now = new Date()) {
  * @param {boolean} [needWeather=true] 是否附加天气
  * @returns {string}
  */
-export function getTimeTag(now = new Date(), needWeather = true) {
-  const weekDay = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][now.getDay()];
-  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+export function getTimeTag(now, needWeather = true) {
+  now = resolveNow(now);
+  const weekDay = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][now.getDay()];  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-  const { timeDesc } = getTimeLight(now);
+  const { timeDesc } = pickTimeLight(now); // 已在上方 resolveNow 过，这里不能再 resolve（否则偏移加两遍）
   const season = getSeason(now.getMonth() + 1);
   const envParts = [`${season}·${timeDesc}`];
   const weather = needWeather ? getCurrentWeather(now.getHours()) : null;
@@ -219,10 +269,11 @@ export function getTimeTag(now = new Date(), needWeather = true) {
  * @param {Date} [now]
  * @returns {string}
  */
-export function getTimeLightTag(now = new Date()) {
+export function getTimeLightTag(now) {
+  now = resolveNow(now);
   const weekDay = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][now.getDay()];
   const dateStr = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')}`;
-  const { timeStr, timeDesc } = getTimeLight(now);
+  const { timeStr, timeDesc } = pickTimeLight(now); // 已在上方 resolveNow 过，这里不能再 resolve（否则偏移加两遍）
   const season = getSeason(now.getMonth() + 1);
   const weather = getCurrentWeather(now.getHours());
   if (weather && weather.weather) {
@@ -253,8 +304,9 @@ export function getSeason(month) {
  * @param {Date} [now]
  * @returns {string}
  */
-export function getLightHint(now = new Date()) {
-  const { timeDesc, lightNote, lightNoteIndoor, hour } = getTimeLight(now);
+export function getLightHint(now) {
+  now = resolveNow(now);
+  const { timeDesc, lightNote, lightNoteIndoor, hour } = pickTimeLight(now); // 已在上方 resolveNow 过，这里不能再 resolve（否则偏移加两遍）
   const season = getSeason(now.getMonth() + 1);
   const weather = getCurrentWeather(hour);
 
@@ -264,8 +316,8 @@ export function getLightHint(now = new Date()) {
     if (weather.temperature) parts.push(weather.temperature);
     if (weather.windSpeed) parts.push(weather.windSpeed);
     if (weatherLight) parts.push(weatherLight);
-    return `${season}日的${timeDesc}时分。外面${parts.join('、')}。${lightNoteIndoor}`;
+    return `${season}的${timeDesc}时分。外面${parts.join('、')}。${lightNoteIndoor}`;
   }
 
-  return `${season}日的${timeDesc}时分。${lightNote}`;
+  return `${season}的${timeDesc}时分。${lightNote}`;
 }

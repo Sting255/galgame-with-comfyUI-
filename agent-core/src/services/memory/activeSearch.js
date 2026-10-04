@@ -10,6 +10,10 @@ import { vectorSearch } from '../vectorClient.js';
 import { embedMemoryText } from './memoryProviders.js';
 import { getMemorySettings, isMemoryV3Enabled } from './memoryConfig.js';
 import { tripleCorpusFor } from './memoryRepository.js';
+// 群聊 ⇄ 私聊 记忆互通（H1）：@memory 回想同样把群来源条目标出出处、同样最多 PRIVATE_GROUP_MEMORY_MAX_ITEMS 条
+import {
+  PRIVATE_GROUP_MEMORY_MAX_ITEMS, isGroupConversationId, groupMemoryTag, selectPrivateChatMemories,
+} from '../groupMemoryLink.js';
 
 const DEFAULT_TOP_K = 8;
 const TRIPLE_TOP_K = 5;
@@ -208,6 +212,7 @@ function annotateResult(item, { getSettings = getMemorySettings, getDepsDb = get
   }
   return {
     memory_id: item.memory_id,
+    conversation_id: item.conversation_id ?? null,
     memory_type: item.memory_type,
     judgment: item.judgment || item.content || '',
     injectionText,
@@ -221,22 +226,32 @@ function annotateResult(item, { getSettings = getMemorySettings, getDepsDb = get
 }
 
 // <memory_recall_result> 注入块：含现行/历史徽标、后继版本与防呆收尾语（§5.2）
-export function formatMemoryRecallBlock(query, results = [], { failed = false } = {}) {
+// groupNames 传入时给群会话来源的条目标【群聊·<群名>】；不传则与旧输出逐字节一致。
+export function formatMemoryRecallBlock(query, results = [], {
+  failed = false,
+  groupNames = null,
+  maxGroupItems = PRIVATE_GROUP_MEMORY_MAX_ITEMS,
+} = {}) {
   const lines = [`（你回想了「${String(query).slice(0, 120)}」，结果是：）`];
   if (failed) {
     lines.push('（回想过程出了点问题，没有找到相关记忆。）');
-  } else if (results.length === 0) {
-    lines.push('（没有想起任何相关记忆。）');
   } else {
-    results.forEach((item, index) => {
-      if (item.isHistorical) {
-        const when = String(item.valid_to || '').slice(0, 16);
-        const successorText = item.successor?.text ? `（后来更新为：${item.successor.text}）` : '';
-        lines.push(`${index + 1}. [历史·已于 ${when} 过时] ${item.injectionText}${successorText}`);
-      } else {
-        lines.push(`${index + 1}. [现行] ${item.injectionText}`);
-      }
-    });
+    // 群来源条目最多 maxGroupItems 条（她自己会话的记忆一条不动）
+    const { results: kept } = selectPrivateChatMemories(results, { maxGroupItems });
+    if (kept.length === 0) {
+      lines.push('（没有想起任何相关记忆。）');
+    } else {
+      kept.forEach((item, index) => {
+        const prefix = isGroupConversationId(item.conversation_id) ? groupMemoryTag(item.conversation_id, groupNames) : '';
+        if (item.isHistorical) {
+          const when = String(item.valid_to || '').slice(0, 16);
+          const successorText = item.successor?.text ? `（后来更新为：${item.successor.text}）` : '';
+          lines.push(`${index + 1}. ${prefix}[历史·已于 ${when} 过时] ${item.injectionText}${successorText}`);
+        } else {
+          lines.push(`${index + 1}. ${prefix}[现行] ${item.injectionText}`);
+        }
+      });
+    }
   }
   lines.push('（没想起来的部分就自然地说不记得，不要编造。）');
   lines.push('（检索已完成，请基于以上内容继续正常回复，不要再输出 @memory 指令。）');

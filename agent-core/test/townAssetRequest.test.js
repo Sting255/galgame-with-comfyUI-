@@ -42,24 +42,28 @@ const npcSource = (npcId, characterId, mode = 'portrait') => ({
   version: 1, sourceKind: 'npc', sourceId: npcId, characterId, mode, signature: 'b'.repeat(64),
 });
 
-test('character 来源：重取 short_prompt + 外观段，而不是素材里的整卡', async t => {
+test('character 来源：重取角色卡的人格 + 外观段，而不是素材里的过期整卡', async t => {
   const { characterId } = seed(t);
   const desc = (await buildAssetRequestSnapshot({
-    meta: { desc: BASE_PROMPT, appearanceSource: characterSource(characterId) },
+    // meta.desc 故意写成一份"过期快照"（与角色卡内容不同），用来证明 desc 是**重取**的
+    meta: { desc: '过期的整卡快照', appearanceSource: characterSource(characterId) },
   })).desc;
-  assert.match(desc, /琪亚娜\(kiana\)，天命卡斯兰娜家族的大小姐/);
+  // ⚠️ 2026-10-02 技术债②：人格部分原来等于库里那份 `short_prompt`（旧裁剪口径的 ~200 字浓缩版），
+  //    现在改成**运行时从 base_prompt 现裁** ⇒ 断言里那句旧 short_prompt 的形态（`琪亚娜(kiana)，天命…`）
+  //    不再适用，改成断言它来自角色卡现裁（含身份 + 性格），并且**不是**素材里那份过期快照。
+  assert.match(desc, /琪亚娜是来自《崩坏3》/);
+  assert.match(desc, /不折不扣的笨蛋/, '现裁会保留性格段（旧口径下这句进不来，那正是"不遵从设定"的来源）');
   assert.match(desc, /银白色长发扎成双麻花辫/);
-  assert.ok(!desc.includes('不折不扣的笨蛋'), '整卡里的非外观段落不该进入需求');
+  assert.ok(!desc.includes('过期的整卡快照'), '不许沿用素材里的过期快照，必须按角色卡重取');
   assert.ok(!desc.includes('##'), '外观段标题行应被清掉');
-  assert.ok(desc.length < BASE_PROMPT.length);
 });
 
-test('npc 来源且关联酒馆角色：优先角色卡的 short_prompt + 外观段', async t => {
+test('npc 来源且关联酒馆角色：优先角色卡的人格 + 外观段', async t => {
   const { npcId, characterId } = seed(t);
   const desc = (await buildAssetRequestSnapshot({
     meta: { desc: '过期的整卡快照', appearanceSource: npcSource(npcId, characterId) },
   })).desc;
-  assert.match(desc, /天命卡斯兰娜家族的大小姐/);
+  assert.match(desc, /天命卡斯兰娜家族名义上的大小姐/);
   assert.match(desc, /银白色长发/);
   assert.ok(!desc.includes('过期的整卡快照'));
 });

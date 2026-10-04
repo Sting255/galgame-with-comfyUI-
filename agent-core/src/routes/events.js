@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { getDb, getSystemRulesWithWorld } from '../db/index.js';
 import { config } from '../config.js';
-import { generateEvent, generateNextBranch, concludeEvent } from '../services/eventGenerator.js';
+import { generateEvent, generateNextBranch, concludeEvent, regenerateEventImage } from '../services/eventGenerator.js';
 import { townStoryOrigins } from '../services/town/townInteractionRuntime.js';
 import {
   parseTownNpcEventId, townNpcEventDto, townNpcEventHistoryDto,
@@ -170,6 +170,26 @@ router.get('/active/:characterId', (req, res) => {
 
 // GET /api/events/by-id/:id — 按 ID 查询事件（活跃表优先，回退历史表）
 // 用于聊天中历史分享卡片还原
+// POST /api/events/:id/image — 给已有奇遇补一张配图（§3.5）
+// 用行里存的 prompt/style/resolution 重走一次生图链路；成功返回新的 /images/events/... URL。
+// 失败返回 200 + {ok:false,error}（**不是 5xx**）：前端要拿这句话显示给用户看，
+// 而不是让它变成一条"请求失败"的红字。
+router.post('/:id/image', async (req, res) => {
+  if (!config.features.events) {
+    return res.status(503).json({ error: 'events_disabled' });
+  }
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid_id' });
+  try {
+    const result = await regenerateEventImage(id);
+    if (!result.ok && result.code === 'not_found') return res.status(404).json({ error: 'event_not_found', message: result.error });
+    res.json(result);
+  } catch (err) {
+    console.error('[events] regenerate image error:', err.message);
+    res.status(500).json({ error: 'internal_error', message: err.message });
+  }
+});
+
 router.get('/by-id/:id', (req, res) => {
   const db = getDb();
   const id = req.params.id;

@@ -4,6 +4,7 @@ import { config, updateFreeEggEnabled, FREE_EGG_MODELS } from '../config.js';
 import { compressLlmImageInputs } from '../services/llmImageInput.js';
 import { acquireSlot, releaseSlot } from '../services/llmConcurrency.js';
 import { recordLlmCall } from '../services/llmTelemetry.js';
+import { notePromptUsage } from '../services/contextUsage.js';
 
 const _limitEnabled = () => config.features.serializeBackgroundLLM;
 
@@ -34,8 +35,27 @@ function outputLogLimit(label) {
 
 // 复用单个 OpenAI 客户端实例，避免每次调用都创建新的 HTTP Agent
 // 频繁创建 client 会实例化底层 undici 连接池，在高并发场景下浪费 FD 和内存
+//
+// §6.1（审查 2026-09-30）：客户端必须跟着**配置**走。以前只靠调用方记得调 `resetClient()`，
+// 一旦某条更新路径漏了（config.js 的 `updateLlmConfig` / `activateLlmProfile` 是直接改 config 对象的），
+// 用户就会遇到"改了 Key/地址不重启不生效"。现在每次取客户端都拿**配置指纹**比一下，
+// 变了就自愈重建 —— 不依赖调用方约定，`resetClient()` 仍然有效。
 let _client = null;
+let _clientFingerprint = '';
+
+/** 影响客户端实例的配置指纹（baseURL / apiKey / 自定义头 / 免费鸡蛋开关） */
+function clientFingerprint() {
+  let headers = null;
+  try { headers = JSON.stringify(config.llm.headers || null); } catch { headers = 'unserializable'; }
+  return [config.llm.baseURL || '', config.llm.apiKey || '', headers, config.llm.freeEgg ? 'egg' : 'self'].join('\u0000');
+}
+
 function getClient() {
+  const fingerprint = clientFingerprint();
+  if (_client && _clientFingerprint !== fingerprint) {
+    console.warn('[llm] 检测到 LLM 配置变化，自动重建客户端（无需调用方记得 resetClient）');
+    _client = null;
+  }
   if (!_client) {
     const opts = {
       baseURL: config.llm.baseURL,
@@ -55,15 +75,18 @@ function getClient() {
       opts.defaultHeaders = { Authorization: null, 'x-opencode-session': sessionId, ...(opts.defaultHeaders || {}) };
     }
     _client = new OpenAI(opts);
+    _clientFingerprint = fingerprint;
   }
   return _client;
 }
 
+/** 显式重建客户端（配置更新的调用方仍然可以调；返回值无） */
 export function resetClient() {
   _client = null;
+  _clientFingerprint = '';
 }
 
-// ── 免费鸡蛋模型轮换：按 deepseek → MiMo → Hy3 依次请求，每个模型只请求一次；
+// ── 免费鸡蛋模型轮换：按 FREE_EGG_MODELS 名单依次请求，每个模型只请求一次；
 //    本轮（本次开启期间）失败过的模型记在内存里，后续请求直接跳过。
 //    全部模型都失败后关闭鸡蛋，并用恢复后的自有配置立即重发当前请求 ──
 let _freeEggFailedModels = new Set();
@@ -199,6 +222,8 @@ async function _chatSyncFreeEgg(messages, opts) {
  * @param {number} opts.maxRetries - SDK 内部重试次数；与外层 retries 独立，缺省不变
  * @param {boolean} opts.returnMeta - true 时返回 { content, finishReason }（判断是否被 max_tokens 截断）；缺省仍只返回 content 字符串
  * @param {boolean} opts.freeEggFailover - false 禁止免费模型轮换/回退自有端点，缺省保持旧行为
+ * @param {number|null} opts.presence_penalty - 反重复采样参数；缺省用 config.llm.antiRepetitionPenalty，null 时请求体不发送该字段
+ * @param {number|null} opts.frequency_penalty - 同上
  * 单次请求用 { signal, timeout: 10000, retries: 0, maxRetries: 0, freeEggFailover: false }。
  */
 export async function chatSync(messages, opts = {}) {
@@ -241,6 +266,25 @@ function awaitSyncSignal(promise, signal) {
     promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
     if (signal.aborted) { signal.removeEventListener('abort', abort); abort(); }
   });
+}
+
+/**
+ * 反重复采样参数（专题 L3 / 规划 C5）：presence_penalty / frequency_penalty 透传。
+ *
+ * 口径（2026-09-30）：
+ *   · 调用方没传（undefined）→ 回退 config.llm.antiRepetitionPenalty / antiRepetitionFrequency
+ *   · 求值后为 null → **请求体里完全不发送该字段**（与加参数前逐字节一致，默认就是这个状态）
+ *   · 数字（含 0）→ 原样透传
+ * 注意：未确认中转站是否接受该参数前，设置页默认留空 ⇒ 行为与历史完全一致。
+ * （专题要求先拿真网关打探针再上 UI；探针属于真实 LLM 调用，需用户授权，本轮未做。）
+ */
+function resolveAntiRepetitionPenalties(presencePenalty, frequencyPenalty) {
+  const presence = presencePenalty === undefined ? config.llm.antiRepetitionPenalty : presencePenalty;
+  const frequency = frequencyPenalty === undefined ? config.llm.antiRepetitionFrequency : frequencyPenalty;
+  const out = {};
+  if (presence !== null && presence !== undefined) out.presence_penalty = presence;
+  if (frequency !== null && frequency !== undefined) out.frequency_penalty = frequency;
+  return out;
 }
 
 async function acquireSyncSlot(signal) {
@@ -338,7 +382,7 @@ function compressLogMessages(messages) {
   });
 }
 
-async function _chatSyncInner(messages, { model = config.llm.model || 'deepseek-flash', max_tokens = 2048, temperature = 0.7, response_format, thinking, label = 'sync', retries = 2, retryDelay = 1000, signal, timeout, maxRetries } = {}) {
+async function _chatSyncInner(messages, { model = config.llm.model || 'deepseek-flash', max_tokens = 2048, temperature = 0.7, response_format, thinking, presence_penalty: presencePenalty, frequency_penalty: frequencyPenalty, label = 'sync', retries = 2, retryDelay = 1000, signal, timeout, maxRetries } = {}) {
   throwIfSyncAborted(signal);
   if (config.features.mergeMessages) messages = mergeConsecutiveRoles(messages);
   const limited = _limitEnabled();
@@ -358,6 +402,8 @@ async function _chatSyncInner(messages, { model = config.llm.model || 'deepseek-
   if (temperature != null) {
     params.temperature = temperature;
   }
+  // 反重复 penalty：默认 null ⇒ 不发送，请求体逐字节不变（见 resolveAntiRepetitionPenalties）
+  Object.assign(params, resolveAntiRepetitionPenalties(presencePenalty, frequencyPenalty));
   if (response_format) {
     params.response_format = response_format;
   }
@@ -405,6 +451,8 @@ async function _chatSyncInner(messages, { model = config.llm.model || 'deepseek-
       console.log(outputLimit === Infinity ? outputText : outputText.slice(0, outputLimit));
       logUsage(label, res.usage);
       recordLlmCall(label, res.usage);
+      // 上下文面板：把真实 prompt_tokens 回填到当前会话的快照（标签不匹配时自动忽略）
+      notePromptUsage(label, res.usage);
       console.log('═════════════════════════════════════════════\n');
 
       // finish_reason 只在 opts.returnMeta 时回传：调用方用它判断输出是不是被 max_tokens 砍断
@@ -426,6 +474,15 @@ async function _chatSyncInner(messages, { model = config.llm.model || 'deepseek-
       }
       // 不可重试或已耗尽重试次数 → 抛出
       console.log(requestLog);
+      // 2026-10-02（真机日志：`[replyQueue] Schedule refresh failed …: 404 404 page not found`）——
+      // 网关的 404 只说"找不到"，**看不出是哪个地址/哪个模型**，用户根本无从排查。
+      // 这里把生效的 model 与 baseURL 一起打出来：404 基本只有两种原因（地址写错 / 模型名不存在）。
+      if (Number(status) === 404) {
+        const effectiveModel = model || config.llm.model || 'deepseek-flash';
+        console.error(`[${providerLabel()} ← ${label}] 404 定位信息：model=${effectiveModel}`
+          + ` baseURL=${config.llm.baseURL || '(未配置)'}`
+          + ` —— 404 通常是「API 地址不对」或「模型名不存在」；请到设置页核对这两项。`);
+      }
       console.log(`[${providerLabel()} ← ${label}] ❌ 最终失败: status=${status}, code=${code}, msg=${msg}`);
       recordLlmCall(label, null, { failed: true });
       console.log('═════════════════════════════════════════════\n');
@@ -488,6 +545,11 @@ async function* _chatStreamFreeEgg(messages, opts) {
  * 已输出过内容则不重发（避免重复输出），直接抛错
  * @returns {AsyncGenerator<string>}
  */
+/**
+ * 流式聊天（用于对话）
+ * opts 额外支持 presence_penalty / frequency_penalty（不传 → 用 config.llm 的全局值；
+ * 两者都为 null 时请求体里不出现这两个字段）。
+ */
 export async function* chatStream(messages, opts = {}) {
   messages = await compressLlmImageInputs(messages);
   let anyYielded = false;
@@ -517,6 +579,8 @@ async function* _chatStreamInner(messages, {
   max_tokens = 4096,
   temperature = 0.7,
   thinking,
+  presence_penalty: presencePenalty,
+  frequency_penalty: frequencyPenalty,
   label = 'stream',
   signal, // AbortSignal：客户端断开时中止上游请求，避免空烧 token
 } = {}) {
@@ -538,6 +602,8 @@ async function* _chatStreamInner(messages, {
       temperature,
       stream: true,
     };
+    // 反重复 penalty：默认 null ⇒ 不发送，请求体逐字节不变（见 resolveAntiRepetitionPenalties）
+    Object.assign(params, resolveAntiRepetitionPenalties(presencePenalty, frequencyPenalty));
 
     const effectiveThinking = thinking === undefined ? configuredThinking() : thinking;
     if (effectiveThinking !== null) {
@@ -582,6 +648,8 @@ async function* _chatStreamInner(messages, {
     if (outputLimit !== Infinity && outputText.length > outputLimit) console.log(`... (${outputText.length} chars total, truncated)`);
     logUsage(label, usage);
     recordLlmCall(label, usage);
+    // 上下文面板：流式 usage 是主回复的真实 prompt_tokens 来源
+    notePromptUsage(label, usage);
     console.log('═══════════════════════════════════════════════\n');
   } catch (err) {
     // 客户端主动中断不是错误，静默返回

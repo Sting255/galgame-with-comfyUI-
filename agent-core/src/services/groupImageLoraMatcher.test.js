@@ -46,13 +46,17 @@ test('matches underscored and spaced names across prompt separators', () => {
   assert.deepEqual(matches.map(character => character.id), [1, 2]);
 });
 
-test('can still match a shorter name when it appears separately', () => {
+test('can still match a longer spaced name, but very short handles no longer match alone', () => {
+  // 行为变更（成因 A3 修复，2026-10-01）：`name` 归一化后去空格 < 5 个字符的别名不再进别名表。
+  // 理由：短别名在普通英文里乱命中的代价是把无关角色 LoRA 塞到链首。
+  // 例如 if 放行 `mei`，就会命中 `a meido waitress portrait` / `a mei tai baby carrier` 这类词。
+  // 真实库里最短的 handle 是 `firefly`（7）与 `yunli`（5），不受影响。
   const matches = matchCharactersInImagePrompt(
     'raiden_mei standing beside mei in a city street',
     characters,
   );
 
-  assert.deepEqual(matches.map(character => character.id), [1, 3]);
+  assert.deepEqual(matches.map(character => character.id), [1], 'raiden mei 命中；裸 mei（3 字母）不再命中');
 });
 
 test('uses token boundaries for short single-token names', () => {
@@ -72,7 +76,10 @@ test('merges LoRAs from multiple characters and deduplicates paths', () => {
   ]);
 });
 
-test('adds the speaker English name when a person prompt omitted all character names', () => {
+test('no longer prepends the speaker name when a person prompt omitted all character names', () => {
+  // 行为变更（成因 A3 修复，2026-10-01）：旧实现把 `speaker.name` 前置成 `chinatsu, a shy young girl…`，
+  // 真机后果是"谁发图就画成谁"（backend-2026-10-01.log:123-126：画面描述的是银狼、前面却被塞上 march7th）。
+  // 新口径：不加任何人物名锚点，只回报 fallbackApplied 供诊断。
   const prepared = applyGroupImageNameFallback(
     'a shy young girl taking a selfie on a summer street',
     [],
@@ -80,7 +87,7 @@ test('adds the speaker English name when a person prompt omitted all character n
   );
 
   assert.deepEqual(prepared, {
-    prompt: 'chinatsu, a shy young girl taking a selfie on a summer street',
+    prompt: 'a shy young girl taking a selfie on a summer street',
     fallbackApplied: true,
   });
 });

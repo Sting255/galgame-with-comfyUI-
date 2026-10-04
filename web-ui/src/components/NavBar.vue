@@ -34,8 +34,7 @@
         <span class="nav-label">奇遇</span>
       </div>
 
-      <router-link to="/town" data-nav="town" class="nav-item" :class="{ active: $route.path.startsWith('/town') }" title="世界">
-        <div class="nav-icon-wrap">
+      <router-link to="/town" data-nav="town" class="nav-item" :class="{ active: $route.path.startsWith('/town') }" title="世界">        <div class="nav-icon-wrap">
           <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="10" />
             <line x1="2" y1="12" x2="22" y2="12" />
@@ -75,6 +74,8 @@
             <path d="M416.8 489.1h60.8v60.8c0 19.3 15.7 35 35 35s35-15.7 35-35v-60.8h60.8c19.3 0 35-15.7 35-35s-15.7-35-35-35h-60.8v-60.8c0-19.3-15.7-35-35-35s-35 15.7-35 35v60.8h-60.8c-19.3 0-35 15.7-35 35s15.7 35 35 35z"/>
           </svg>
           <span v-if="mailbox.unreadCount > 0" class="nav-dot">{{ mailbox.unreadCount > 99 ? '99+' : mailbox.unreadCount }}</span>
+          <!-- 《邻舍日报》未读：复用信箱同一套 nav-dot 红点语言，落在左上位避免与右上数字徽标叠在一起 -->
+          <span v-if="newspaper.unread" class="nav-dot nav-dot-daily" title="今天的《邻舍日报》还没读"></span>
         </div>
         <span class="nav-label">酒馆</span>
       </router-link>
@@ -90,6 +91,22 @@
         </div>
         <span class="nav-label">设置</span>
       </router-link>
+
+      <!-- 出图服务状态（2026-10-01，规划 §一-4）：
+           ComfyUI 没开时**每个要图的功能都会失败**（聊天配图、朋友圈、奇遇、一键生成…），
+           用户此前只能靠"图怎么又没出来"发现。这里给一眼可见的状态 + 一句怎么处理，
+           把这类反馈消在源头。数据复用既有 `GET /api/images/comfyui-health`（3s 超时，轻）。
+           非交互元素（不点击），所以按 AGENTS.md 用自包含样式而不是按钮组件。 -->
+      <div
+        class="nav-comfy"
+        :class="comfy.online ? 'is-online' : 'is-offline'"
+        :title="comfy.title"
+        role="status"
+        aria-live="polite"
+      >
+        <span class="nav-comfy-dot" aria-hidden="true"></span>
+        <span class="nav-label">{{ comfy.online ? '出图在线' : '出图离线' }}</span>
+      </div>
     </div>
   </nav>
 </template>
@@ -102,8 +119,10 @@ import { useEventsStore } from '../stores/events.js'
 import { useProactiveStore } from '../stores/notifications.js'
 import { useScheduleStore } from '../stores/schedule.js'
 import { useMailboxStore } from '../stores/mailbox.js'
+import { useNewspaperStore } from '../stores/newspaper.js'
 import { useUpdateStore } from '../stores/updateInfo.js'
 import { startUnifiedStream, stopUnifiedStream } from '../stores/unifiedStream.js'
+import { comfyuiHealth } from '../api/index.js'
 import GearIcon from './GearIcon.vue'
 
 const router = useRouter()
@@ -113,6 +132,7 @@ const events = useEventsStore()
 const proactive = useProactiveStore()
 const scheduleStore = useScheduleStore()
 const mailbox = useMailboxStore()
+const newspaper = useNewspaperStore()
 const updateInfo = useUpdateStore()
 
 function handleMomentsClick() {
@@ -140,6 +160,34 @@ function handleScheduleClick() {
   } else {
     router.push('/schedule')
   }
+}
+
+// ── 出图服务状态（规划 §一-4，2026-10-01）──────────────────────────────
+// ComfyUI 没开时，所有要图的功能都会失败（聊天配图 / 朋友圈 / 奇遇 / 一键生成），
+// 而用户此前只能从"图又没出来"反推。这里轮询既有健康端点，给一眼可见的状态。
+// · 30 秒一次：够快能反映"刚启动好"，又不至于一直敲它（该端点自己 3s 超时）。
+// · 失败一律当离线（`comfyuiHealth()` 已经把异常吞成 `{connected:false}`）。
+// · 文案要说"怎么办"，不只是"不在线"。
+const comfy = ref({ online: false, title: '正在检查出图服务（ComfyUI）…' })
+let comfyTimer = null
+
+async function refreshComfyStatus() {
+  const res = await comfyuiHealth()
+  const online = res?.connected === true
+  const url = res?.url || ''
+  comfy.value = online
+    ? { online: true, title: `出图服务在线${res?.device ? '（' + res.device + '）' : ''}${url ? ' · ' + url : ''}` }
+    : {
+      online: false,
+      title: '出图服务（ComfyUI）没在跑：聊天配图、朋友圈配图、奇遇配图、一键生成都会失败。\n'
+        + '先把 ComfyUI 启动起来（启动后约 30~45 秒加载完），这个灯会自己变绿。'
+        + (url ? `\n地址：${url}` : ''),
+    }
+}
+
+function startComfyPolling() {
+  refreshComfyStatus()
+  if (!comfyTimer) comfyTimer = setInterval(refreshComfyStatus, 30000)
 }
 
 // ── 游戏菜单式滑动指示器 ──
@@ -184,6 +232,8 @@ onMounted(() => {
   moments.connectSSE()
   events.connectSSE()
   mailbox.startPolling()
+  newspaper.startPolling()
+  startComfyPolling()
 })
 
 function handleRouteReselected(event) {
@@ -197,6 +247,8 @@ onUnmounted(() => {
   moments.disconnectSSE()
   events.disconnectSSE()
   mailbox.stopPolling()
+  newspaper.stopPolling()
+  if (comfyTimer) { clearInterval(comfyTimer); comfyTimer = null }
 })
 </script>
 
@@ -251,6 +303,36 @@ onUnmounted(() => {
   flex-direction: column;
   align-items: center;
 }
+
+/* 出图服务状态（规划 §一-4）：小圆点 + 一个字，沿用 nav-label 的字号与 --text-secondary 色阶 */
+.nav-comfy {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 4px 10px;
+  width: 65px;
+  cursor: default;
+}
+.nav-comfy-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  opacity: 0.5;
+  transition: background 0.3s var(--ease-standard), opacity 0.3s var(--ease-standard), box-shadow 0.3s var(--ease-standard);
+}
+.nav-comfy.is-online .nav-comfy-dot {
+  background: var(--accent);
+  opacity: 1;
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.18);
+}
+.nav-comfy.is-offline .nav-comfy-dot {
+  background: var(--text-secondary);
+  opacity: 0.45;
+}
+.nav-comfy.is-offline .nav-label { opacity: 0.6; }
+.nav-comfy .nav-label { font-size: 10px; white-space: nowrap; }
 
 .nav-item {
   display: flex;
@@ -307,6 +389,18 @@ onUnmounted(() => {
   text-align: center;
   white-space: nowrap;
   animation: cel-jelly 0.45s var(--ease-spring) both;
+}
+
+/* 《邻舍日报》未读点：与信箱数字徽标同皮肤同动效，只是收成小圆点、落到图标左上位 */
+.nav-dot-daily {
+  top: -5px;
+  right: auto;
+  left: -8px;
+  width: 12px;
+  min-width: 12px;
+  height: 12px;
+  padding: 0;
+  border-radius: 50%;
 }
 
 

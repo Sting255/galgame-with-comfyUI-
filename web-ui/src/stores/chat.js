@@ -3,6 +3,10 @@ import { ref, computed } from 'vue'
 import * as api from '../api/index.js'
 import { useMessageWindow } from '../composables/useMessageWindow.js'
 import { useProactiveStore } from './notifications.js'
+import { applyAssistantReplace } from '../utils/assistantReplace.js'
+
+/** D2 重写兜底：最近一次已应用的 replace_last_assistant.turn（§12.4 用它校验「替换的是本轮」，防乱序/重复投递） */
+let lastReplaceTurn = 0
 
 let _seq = Date.now()
 function uid() { return ++_seq }
@@ -61,6 +65,7 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function loadMessages(charId) {
+    clearTouchPlaceholder()
     const request = ++historySeq
     try {
       const d = await api.getMessages(charId);
@@ -174,6 +179,7 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function selectChar(charId) {
+    clearTouchPlaceholder()
     const selection = ++selectionSeq
     if (activeStream) {
       cancelActiveStream()
@@ -206,6 +212,7 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function clearActiveMessages() {
+    clearTouchPlaceholder()
     const id = activeCharId.value
     if (!id) return
     cancelActiveStream()
@@ -527,6 +534,24 @@ export const useChatStore = defineStore('chat', () => {
               const newId = uid()
               bubbleIds.push(newId)
             }
+            // ── replace_last_assistant（D2 重写兜底 · docs/anti-repetition.md §12.4，形状已冻结）──
+            // 后端**只在重写成功后**发（失败/空流不发，所以这里不用处理空内容）。
+            // 形状：{ content, segments:[{content, emojiKeys, images}], reason:'reroll', turn }
+            //   · segments 是**超集**：逐气泡对齐，替换后**不能丢表情包与图片**（见 utils/assistantReplace.js）
+            //   · content 只是简单路径（所有文本气泡用 \n\n 拼），这里用它同步 fullResponse
+            //   · turn 是服务端时间戳，用来校验「替换的是本轮」—— 比已应用的更旧就丢弃（防乱序 / 重复投递）
+            if (lastEvent === 'replace_last_assistant' && Array.isArray(d.segments) && d.segments.length > 0) {
+              const turn = Number(d.turn)
+              const stale = Number.isFinite(turn) && turn > 0 && turn < lastReplaceTurn
+              if (!stale) {
+                if (Number.isFinite(turn) && turn > 0) lastReplaceTurn = turn
+                if (_bufTimer) { clearTimeout(_bufTimer); _bufTimer = null }
+                clearPendingEmojiTimers()
+                applyAssistantReplace({ messages: messages.value, bubbleIds, segments: d.segments, uid, now: new Date().toISOString() })
+                if (d.content !== undefined && d.content !== null) fullResponse = d.content
+              }
+            }
+
             // ── context_update ──
             if (lastEvent === 'context_update' && d.content !== undefined && d.content !== null) {
               fullResponse = d.content
@@ -805,7 +830,37 @@ export const useChatStore = defineStore('chat', () => {
    * - 更新角色列表中该角色的 last_message
    * - 如果是当前活跃角色，直接追加到消息列表
    */
+  // ── 等待期占位气泡（专题 §八 8.2 可选加强）──
+  // 点动作 到 她的文字反应上屏之间还有 3~5 秒静默。这里插一条**本地**占位气泡（typing 态），真消息一到就撤。
+  // 关键：用 **本地 id + `placeholder` 标记**精确定位 —— 绝不按内容或位置删，免得误删她的真消息。
+  // 15 秒超时兜底：异常 / 广播没来也不会残留。
+  const TOUCH_PLACEHOLDER_TEXT = '她正感受着你的动作……'
+  const TOUCH_PLACEHOLDER_TIMEOUT_MS = 15000
+  let touchPlaceholderTimer = null
+
+  function clearTouchPlaceholder() {
+    if (touchPlaceholderTimer) { clearTimeout(touchPlaceholderTimer); touchPlaceholderTimer = null }
+    const at = messages.value.findIndex(m => m && m.placeholder === 'touch')
+    if (at >= 0) messages.value.splice(at, 1)
+  }
+
+  function showTouchPlaceholder() {
+    clearTouchPlaceholder()  // 先清再加：连点也不会堆出第二条
+    messages.value.push({
+      id: 'touch-placeholder-' + Date.now(),
+      role: 'assistant',
+      type: 'text',
+      content: TOUCH_PLACEHOLDER_TEXT,
+      placeholder: 'touch',
+      typing: true,
+      created_at: new Date().toISOString(),
+    })
+    touchPlaceholderTimer = setTimeout(clearTouchPlaceholder, TOUCH_PLACEHOLDER_TIMEOUT_MS)
+  }
+
   function handleProactiveMessage(data) {
+    // 她的真消息到了 —— 撤掉等待期占位（这是最主要的移除路径）
+    clearTouchPlaceholder()
     const charId = data.character_id
 
     // 更新角色列表中的预览 + 冒泡到最上面
@@ -905,6 +960,35 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  /**
+   * 私聊两段式反应的**后半段**（专题 §八 8.2）：文字先广播上屏，图好了再来一条 update。
+   * payload（后端定，**未落地前按此写**）：{ msg_id, raw_id, images }
+   * 语义：按 **msg_id** 找到**已有**那条文字气泡，**在它后面插入** image_gen 气泡；
+   *      去重复用 handleProactiveMessage 的 alreadyHas 口径（重复投递不重复挂）；
+   *      找不到 msg_id 一律**安全忽略**（不新建气泡、不报错 —— 可能是别的会话或已切走）。
+   */
+  function handleProactiveMessageUpdate(data) {
+    clearTouchPlaceholder()  // 兜底：只有图、没有文字广播的异常路径也别让占位留着
+    if (!data || !data.msg_id) return
+    if (!Array.isArray(data.images) || data.images.length === 0) return
+    const idx = messages.value.findIndex(m => m.id === data.msg_id)
+    if (idx < 0) return
+    // 去重：紧跟在锚点后面的那条 image_gen 若已是同一批图，就不再挂（与 handleProactiveMessage 同口径）
+    const next = messages.value[idx + 1]
+    const alreadyHas = next?.type === 'image_gen' && next.images?.length === data.images.length
+      && next.images.every((img, i) => img.url === data.images[i])
+    if (alreadyHas) return
+    messages.value.splice(idx + 1, 0, {
+      id: uid(),
+      role: 'assistant',
+      type: 'image_gen',
+      genId: 'proactive_' + (data.raw_id || data.msg_id) + '_' + Date.now(),
+      genStatus: 'done',
+      images: data.images.map(url => ({ url, base64: null })),
+      created_at: new Date().toISOString(),
+    })
+  }
+
   return { characters, activeCharId, messages, queuedReplies, visibleMessages, streaming, streamingContent, showTypingDots, memoryRecalling, hasMoreOlder, guesses, realtimeAffinity, affinityKey, activeChar, sidebarScrollSignal,
-    loadCharacters, loadMessages, expandWindow, selectChar, updateActiveCharacter, clearActiveMessages, undoLastRound, generateCharacter, uploadAvatar, getRecentChatImages, deleteActiveCharacter, sendMessage, handleProactiveMessage, handleDelayedReply, bumpImageUrls }
+    loadCharacters, loadMessages, expandWindow, selectChar, updateActiveCharacter, clearActiveMessages, undoLastRound, generateCharacter, uploadAvatar, getRecentChatImages, deleteActiveCharacter, sendMessage, handleProactiveMessage, handleProactiveMessageUpdate, handleDelayedReply, bumpImageUrls, showTouchPlaceholder, clearTouchPlaceholder }
 })

@@ -10,7 +10,7 @@
  */
 
 import { getDb } from '../db/index.js';
-import { getLocalDateKey } from '../utils/localDate.js';
+import { getProgramDateKey, getProgramNow } from './programTime.js';
 import { updateSpecialMomentStatus, ensurePendingScheduleChanges } from './scheduleEditor.js';
 
 const CHECK_INTERVAL = 5 * 60 * 1000; // 5 分钟
@@ -30,15 +30,19 @@ function toMin(hhmm) {
 function saveScheduleJson(characterId, schedule) {
   getDb().prepare(
     'UPDATE daily_schedules SET schedule_json = ? WHERE character_id = ? AND schedule_date = ?'
-  ).run(JSON.stringify(schedule), characterId, getLocalDateKey());
+  ).run(JSON.stringify(schedule), characterId, getProgramDateKey(getProgramNow()));
 }
 
 /**
  * 扫描今日所有角色的特殊日程：
  * - 时段内且 pending → 标记 generating 并返回待生成列表
  * - 已过时段且 pending → 标记 expired（过时不候）
+ *
+ * 「今日」与 `now` 都用**程序时间**（世界钟）：日程快照是按程序日期存的，
+ * 用真实日期会查不到快照（跳天之后特殊朋友圈整批不触发）。
+ * 定时器本身仍然每 5 分钟按真实时间跑（见交付报告「仍只跟真实时间走」）。
  */
-export function collectDueSpecialMoments(now = new Date()) {
+export function collectDueSpecialMoments(now = getProgramNow()) {
   const db = getDb();
   const rows = db.prepare(`
     SELECT d.character_id, d.schedule_json, c.display_name, c.moments_disabled
@@ -46,7 +50,7 @@ export function collectDueSpecialMoments(now = new Date()) {
     JOIN characters c ON c.id = d.character_id
     WHERE d.schedule_date = ?
       AND (c.schedule_enabled = 1 OR c.schedule_enabled IS NULL)
-  `).all(getLocalDateKey(now));
+  `).all(getProgramDateKey(now));
 
   const nowMin = now.getHours() * 60 + now.getMinutes();
   const due = [];

@@ -24,6 +24,8 @@ let _conn = null
 let _reconnectTimer = null
 let _stableTimer = null
 let _started = false
+let _connected = false
+export const isUnifiedStreamConnected = () => _connected
 let _backoff = BACKOFF_INITIAL
 
 /** Map<eventType, Set<handler>> */
@@ -51,6 +53,7 @@ export const offEvent = (eventType, handler) => {
 }
 
 function _dispatch(eventType, data) {
+  if (eventType === 'connected') _connected = true
   const handlers = _handlers.get(eventType)
   if (handlers) {
     for (const fn of handlers) {
@@ -66,6 +69,16 @@ function _connect() {
 
   _conn = api.connectUnifiedStream({
     connected:         () => { _dispatch('connected', {}); _stableTimer = setTimeout(_onStable, 15000) },
+    // 断线是**连接生命周期事件**（由本文件 onClose 内部 `_dispatch('disconnected')` 发出，
+    // 不是服务端 SSE 事件名）。2026-10-04 合并上游 v3.6.3 时补进白名单：
+    // 上游新增的 `components/standing/StandingInteractionControls.vue` 订阅了它，
+    // 而本地守卫 `test/timeControlSseWhitelist.test.js` 要求「有订阅就必须在白名单里」。
+    // 服务端不会发这个名字，所以这一行实际不会触发；它只是让静态守卫能对上账。
+    disconnected:      d => _dispatch('disconnected', d),
+    // 批量装卸玩具（2026-10-04）：后端 `POST /:id/toys/batch` 是**静默操作**（不逐件产反应消息），
+    // 所以它只能靠这条广播把"穿戴清单变了"告诉别的窗口/设备（PC 与手机同时开着时）。
+    // 订阅方：`components/ToyPanel.vue`（收到就重取清单）。
+    toys_batch_changed: d => _dispatch('toys_batch_changed', d),
     standing_display_state: d => _dispatch('standing_display_state', d),
     expression_standings_updated: d => _dispatch('expression_standings_updated', d),
     new_event:         d => _dispatch('new_event', d),
@@ -77,9 +90,14 @@ function _connect() {
     new_comment:       d => _dispatch('new_comment', d),
     user_moment_vision_error: d => _dispatch('user_moment_vision_error', d),
     proactive_message: d => _dispatch('proactive_message', d),
+  // 私聊两段式（专题 §八 8.2）：文字先上屏，图好了再补 —— 后端 payload { msg_id, raw_id, images }
+  proactive_message_update: d => _dispatch('proactive_message_update', d),
     reply_processing:  d => _dispatch('reply_processing', d),
     reply_ready:       d => _dispatch('reply_ready', d),
     delayed_reply:     d => _dispatch('delayed_reply', d),
+    // 世界翻篇（程序日期变了）：后端 programDayRollover 广播，newspaper store 收到立刻拉新一期；
+    // 2026-10-02 补进白名单 —— 此前广播发得出来、这里没放行 ⇒ 订阅方永远收不到（死订阅）。
+    program_day_rollover: d => _dispatch('program_day_rollover', d),
     schedule_peek_ready: d => _dispatch('schedule_peek_ready', d),
     schedule_peek_progress: d => _dispatch('schedule_peek_progress', d),
     schedule_reset_progress: d => _dispatch('schedule_reset_progress', d),
@@ -88,7 +106,13 @@ function _connect() {
     image_compress_progress: d => _dispatch('image_compress_progress', d),
     group_message:     d => _dispatch('group_message', d),
     group_message_update: d => _dispatch('group_message_update', d),
+    // 亲密刺激下游（累积/心情/敏感度）：后端 intimateStimulus.js 一直在广播，
+    // **这里漏了**⇒ 推进面板的"实时更新"从来没生效过（2026-10-03 复查抓到的死广播：
+    // 自动插入开着、面板看别处时，库里在涨而界面一动不动）。推进面板已订阅它刷新 HUD。
+    intimate_stimulus: d => _dispatch('intimate_stimulus', d),
     group_created:     d => _dispatch('group_created', d),
+    // 群聊「撤回一轮」：groups.js 有订阅，2026-10-02 补进白名单（同 program_day_rollover，原先收不到）
+    group_round_undone: d => _dispatch('group_round_undone', d),
     group_image_start: d => _dispatch('group_image_start', d),
     group_image_done:  d => _dispatch('group_image_done', d),
     group_image_error: d => _dispatch('group_image_error', d),
@@ -96,6 +120,9 @@ function _connect() {
     image_edit_task_progress: d => _dispatch('image_edit_task_progress', d),
     image_edit_task_done:     d => _dispatch('image_edit_task_done', d),
     image_edit_task_error:    d => _dispatch('image_edit_task_error', d),
+    // 角色资产「一键后台生成」进度：AssetGenerationModal 有订阅，2026-10-02 补进白名单
+    // （它另有 2.5s 轮询兜底，所以这条死订阅一直没被用户发现）
+    asset_generation_progress: d => _dispatch('asset_generation_progress', d),
     // AI 小镇（世界页）
     town_move:            d => _dispatch('town_move', d),
     town_bubble:          d => _dispatch('town_bubble', d),
@@ -117,6 +144,8 @@ function _connect() {
     // 小镇货摊买来的道具送给角色：礼物叙事（图片 + 描述）
     item_gift_ready:           d => _dispatch('item_gift_ready', d),
     item_gift_progress:        d => _dispatch('item_gift_progress', d),
+    // 宝箱 / 道具出图完成：backpack store 有订阅，2026-10-02 补进白名单
+    item_ready:                d => _dispatch('item_ready', d),
   }, {
     onClose: _scheduleReconnect,
   })
@@ -129,7 +158,9 @@ function _onStable() {
 
 /** 断开后立即调度重连（指数退避 1s→2s→4s→...→30s） */
 function _scheduleReconnect() {
+  _connected = false
   if (!_started) return
+  _dispatch('disconnected', {})
   if (_reconnectTimer) clearTimeout(_reconnectTimer)
   if (_stableTimer) { clearTimeout(_stableTimer); _stableTimer = null }
 
@@ -152,6 +183,7 @@ export function startUnifiedStream() {
 
 /** 停止统一 SSE 连接（NavBar onUnmounted 调用） */
 export function stopUnifiedStream() {
+  _connected = false
   _started = false
   _backoff = BACKOFF_INITIAL
   if (_conn) { _conn.close(); _conn = null }

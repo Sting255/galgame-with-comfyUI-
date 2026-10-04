@@ -21,6 +21,7 @@ import { submitWorkflow, apiToGui } from './comfyClient.js';
 import { config, getNovelaiApiKey } from '../config.js';
 import { acquireSlot, releaseSlot } from './llmConcurrency.js';
 import { prepareImagePrompt } from './imagePromptPreparer.js';
+import { stripImagePromptRuleEcho } from '../utils/groupImagePrompt.js';
 
 const _limitEnabled = () => config.features.serializeBackgroundLLM;
 import { ACTIVE_WORKFLOW, PRO_WORKFLOW, checkWorkflowHealth } from './workflowTemplates.js';
@@ -550,17 +551,29 @@ async function submitWithRetry(rawPrompt, {
   if (onProgress) onProgress({ stage: 'submitting' });
 
   // 3. 提交 ComfyUI，带重试循环
+  //
+  // 2026-10-01 修（现场：logs/backend-2026-10-01.log:156-167）：
+  //   `[error] [imageSkill] ComfyUI attempt 1/2/3 failed: fetch failed`
+  //   → `All ComfyUI submit attempts exhausted, generation failed`
+  //   三次各隔 2s / 3s，**总共约 5 秒**就放弃。用户「邻舍先起、ComfyUI 后起（还在加载模型）」
+  //   时必然全灭，而且日志里只有一行 fetch failed，看不出是「没启动」还是「这段 prompt 被拒」。
+  // 现在分两类对待：
+  //   · 连不上（fetch failed / ECONNREFUSED / 超时）⇒ ComfyUI 正在启动也说不定，多给几次机会、拉长间隔；
+  //   · 其它（节点/模型缺失、prompt 校验失败）⇒ 等再久也没用，维持快速失败。
   let lastResult = null;
+  const baseRetries = submitRetries;
+  const unreachableRetries = Math.max(submitRetries, 3);
+  let warnedUnreachable = false;
 
-  for (let attempt = 0; attempt <= submitRetries; attempt++) {
+  for (let attempt = 0; ; attempt++) {
     if (attempt > 0) {
-      console.log(`[imageSkill] ComfyUI submit retry ${attempt}/${submitRetries} — re-randomizing seed`);
+      console.log(`[imageSkill] ComfyUI submit retry ${attempt} — re-randomizing seed`);
       for (const node of wf.nodes || []) {
         if (node.type === 'KSampler' && node.widgets_values.length > 1 && node.widgets_values[1] === 'randomize') {
           node.widgets_values[0] = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
         }
       }
-      if (onProgress) onProgress({ stage: 'retrying', attempt, maxRetries: submitRetries });
+      if (onProgress) onProgress({ stage: 'retrying', attempt, maxRetries: unreachableRetries });
     }
 
     try {
@@ -577,35 +590,121 @@ async function submitWithRetry(rawPrompt, {
       lastResult = { success: false, images: [], source: null, error: err.message };
     }
 
-    if (attempt < submitRetries) {
-      const waitMs = 2000 + attempt * 1000;
-      console.log(`[imageSkill] Waiting ${waitMs}ms before retry...`);
-      await new Promise(r => setTimeout(r, waitMs));
+    const unreachable = isComfyUnreachable(lastResult?.error);
+    if (unreachable && !warnedUnreachable) {
+      warnedUnreachable = true;
+      console.warn('[imageSkill] ComfyUI 连不上（多半是还没启动 / 正在加载模型）—— 本次会多等几轮再放弃');
     }
+    const budget = unreachable ? unreachableRetries : baseRetries;
+    if (attempt >= budget) break;
+
+    const waitMs = unreachable ? 3000 + attempt * 6000 : 2000 + attempt * 1000;
+    console.log(`[imageSkill] Waiting ${waitMs}ms before retry...`);
+    await new Promise(r => setTimeout(r, waitMs));
   }
 
-  console.log('[imageSkill] All ComfyUI submit attempts exhausted, generation failed');
-  return { success: false, images: [], source: null, error: lastResult?.error || 'All ComfyUI attempts exhausted', wfMode };
+  const errText = lastResult?.error || 'All ComfyUI attempts exhausted';
+  const unreachable = isComfyUnreachable(errText);
+  console.log(`[imageSkill] All ComfyUI submit attempts exhausted, generation failed${unreachable ? '（ComfyUI 不可达）' : ''}`);
+  return {
+    success: false, images: [], source: null, wfMode,
+    // 给调用方/界面一句能看懂的原因：连不上 vs 被拒（后者通常是缺节点或缺模型）
+    error: unreachable ? `ComfyUI 连不上（没启动或还在加载），最后一次错误：${errText}` : errText,
+  };
+}
+
+/**
+ * 「ComfyUI 根本连不上」类错误的判定（对比「它收到了但拒绝了」）。
+ * 只有这一类才值得拉长重试；节点/模型缺失、prompt 校验失败等重试再多次也一样。
+ * 导出给单测（test/imagePromptRuleEcho.test.js）用。
+ */
+export function isComfyUnreachable(message) {
+  const text = String(message || '').toLowerCase();
+  if (!text) return false;
+  return /fetch failed|econnrefused|econnreset|econnaborted|etimedout|socket hang up|network error|timed? ?out|aborted/.test(text);
 }
 
 // ── 优先级队列 ──
 let activeTaskCount = 0;
-let lowQueue = [];           // { rawPrompt, opts, resolve, reject }
+let lowQueue = [];           // { rawPrompt, opts, resolve, reject, enqueuedAt }
 let processingLow = false;
 let lastHighTime = 0;
+let lowRetryTimer = null;
 const QUIET = 180_000;        // 高优任务后 180s 内不派发低优
+/**
+ * 低优任务的**防饿死上限**（2026-10-01，用户真机日志里那场 52 分钟冻结）。
+ *
+ * 日志实证：朋友圈配文 5 秒就写好了，但它的**配图**任务在同一时刻被排进低优队列，
+ * 直到 **52 分钟后**才被派发 —— 这 52 分钟里用户一直在聊/摸（高优任务不断刷新 `lastHighTime`），
+ * 而低优只在「距上一个高优 ≥180s」时才开始 ⇒ **只要用户在玩，后台图永远排不上**。
+ * 受害的不只是那张图：朋友圈 / 奇遇 / 主动聊天三个调度器都在 `await` 它，
+ * 于是三个玩法**同时卡死**（日志里 05:05–05:47 三个调度器连续跳过 5~8 个 tick）。
+ *
+ * 现在：低优任务最多等 `LOW_QUEUE_MAX_WAIT`，超过就不再遵守静默期（**仍然只在没有任务在跑时**派发，
+ * 不去抢正在生成的那一张），并打一条 warn 让这件事在日志里可见。
+ */
+const LOW_QUEUE_MAX_WAIT = 10 * 60_000;
+
+/**
+ * 是否该派发队首的低优任务。抽成**纯函数**是为了能单测这条策略：
+ * 静默期没到 + 还没等够 → 继续等；静默期没到但已经等太久 → 放行（防饿死）；静默期到了 → 放行。
+ *
+ * @param {number} now
+ * @param {number} lastHigh      上次高优任务时刻
+ * @param {number} enqueuedAt    队首任务入队时刻
+ * @param {number} [quietMs]
+ * @param {number} [maxWaitMs]
+ * @returns {{dispatch: boolean, waitMs: number, starved: boolean}}
+ */
+export function decideLowDispatch(now, lastHigh, enqueuedAt, quietMs = QUIET, maxWaitMs = LOW_QUEUE_MAX_WAIT) {
+  const remaining = quietMs - (now - Number(lastHigh || 0));
+  if (remaining <= 0) return { dispatch: true, waitMs: 0, starved: false };
+  const waited = now - Number(enqueuedAt || now);
+  if (waited >= maxWaitMs) return { dispatch: true, waitMs: 0, starved: true };
+  return { dispatch: false, waitMs: remaining + 100, starved: false };
+}
+
+/** 排一次复查。**必须能重复排**：以前 `activeTaskCount>0` 时直接 return 且不排复查，
+ *  若此后没有高优任务再触发 `processLowQueue`，低优队列就永久停摆了。 */
+function scheduleLowRetry(ms) {
+  if (lowRetryTimer) return;
+  lowRetryTimer = setTimeout(() => { lowRetryTimer = null; processLowQueue(); }, Math.max(500, ms));
+  if (typeof lowRetryTimer.unref === 'function') lowRetryTimer.unref();
+}
 
 async function _execute(rawPrompt, opts) {
   activeTaskCount++;
   let slotAcquired = false;
   try {
-    const preparation = await prepareImagePrompt(rawPrompt, {
+    // 0. 送进 CLIP 之前先剥掉模型回显的生图规范原文（2026-10-01 修，见 groupImagePrompt.js 长注释）。
+    //    放在这里而不是各调用点，是为了让 event / newspaper / moments / schedule / group / chat /
+    //    touch / toy / portrait / standalone / maibot **所有**生图入口一次生效。
+    //    规范特征词都没有时是零开销快路径。
+    const sanitized = stripImagePromptRuleEcho(rawPrompt);
+    if (sanitized.changed) {
+      console.log(`[imageSkill] 画面描述剥离规范回显：${String(rawPrompt).length} → ${sanitized.prompt.length} 字`);
+    }
+    if (sanitized.isEmpty) {
+      // 整条都是规范原文 ⇒ 送进去只会得到一张和剧情毫无关系的图，不如明确失败。
+      throw Object.assign(new Error('画面描述里只有生图规范原文，没有可用的场景内容'), { code: 'image_prompt_rule_echo_only' });
+    }
+    const prompt = sanitized.prompt;
+
+    // 0b. 连一个英文字母都没有 ⇒ 这是「模型把中文要求当成了画面描述」那类退化
+    //     （全仓有多处 `text.length >= 5` 的弱校验：schedule.js / proactiveChatScheduler.js /
+    //      characters.js / imagePromptResponse.js）。中文喂给 CLIP 只会得到一张与剧情无关的图，
+    //     与其出一张错的，不如明确失败。**例外**：标准生图页（`promptScene: 'standalone'`）是
+    //     用户自己在输入框里写什么就画什么，不拦。
+    if (!/[A-Za-z]/.test(prompt) && opts.promptScene !== 'standalone') {
+      throw Object.assign(new Error('画面描述里没有任何英文内容（多半是模型把中文写作要求当成了画面描述）'), { code: 'image_prompt_not_english' });
+    }
+
+    const preparation = await prepareImagePrompt(prompt, {
       ragQuery: opts.ragQuery,
       disableRAG: opts.disableRAG === true,
       scene: opts.promptScene || opts.scene || 'chat',
       alreadyPrepared: opts.alreadyPrepared === true,
       skipOptimization: opts.skipOptimization === true,
-      persist: opts.persistPreparation !== false,
       ragTimeoutMs: opts.ragTimeoutMs,
     });
     if (_limitEnabled()) {
@@ -618,7 +717,6 @@ async function _execute(rawPrompt, opts) {
       promptOriginal: preparation.promptOriginal,
       promptRagQuery: preparation.ragQuery,
       promptRefined: preparation.promptRefined,
-      promptPreparationId: preparation.preparationId,
       promptKnowledgeIds: preparation.retrieval.knowledgeIds,
       promptKnowledgeVersion: preparation.retrieval.knowledgeVersion,
       promptRetrievalMode: preparation.retrieval.mode,
@@ -633,12 +731,15 @@ async function _execute(rawPrompt, opts) {
 
 function processLowQueue() {
   if (processingLow || lowQueue.length === 0) return;
-  if (activeTaskCount > 0) return;
+  // 有任务在跑：不插队，但**一定要排复查**（否则没有后续高优任务时队列永久停摆）
+  if (activeTaskCount > 0) { scheduleLowRetry(5_000); return; }
 
-  const remaining = QUIET - (Date.now() - lastHighTime);
-  if (remaining > 0) {
-    setTimeout(processLowQueue, remaining + 100);
-    return;
+  const head = lowQueue[0];
+  const verdict = decideLowDispatch(Date.now(), lastHighTime, head.enqueuedAt);
+  if (!verdict.dispatch) { scheduleLowRetry(verdict.waitMs); return; }
+  if (verdict.starved) {
+    console.warn(`[imageSkill] 低优生图已等 ${Math.round((Date.now() - Number(head.enqueuedAt || Date.now())) / 1000)}s`
+      + `（上限 ${Math.round(LOW_QUEUE_MAX_WAIT / 1000)}s），跳过静默期直接派发，避免后台玩法被饿死；队列还剩 ${lowQueue.length} 张`);
   }
 
   processingLow = true;
@@ -656,7 +757,7 @@ export function isUserQuiet(quietMs = QUIET) {
 export async function generateImage(rawPrompt, opts = {}) {
   if (opts.priority === 'low') {
     return new Promise((resolve, reject) => {
-      lowQueue.push({ rawPrompt, opts, resolve, reject });
+      lowQueue.push({ rawPrompt, opts, resolve, reject, enqueuedAt: Date.now() });
       processLowQueue();
     });
   }
@@ -667,7 +768,7 @@ export async function generateImage(rawPrompt, opts = {}) {
 export async function generateImageRaw(rawPrompt, opts = {}) {
   if (opts.priority === 'low') {
     return new Promise((resolve, reject) => {
-      lowQueue.push({ rawPrompt, opts, resolve, reject });
+      lowQueue.push({ rawPrompt, opts, resolve, reject, enqueuedAt: Date.now() });
       processLowQueue();
     });
   }

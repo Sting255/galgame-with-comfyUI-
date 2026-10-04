@@ -24,11 +24,17 @@ router.get('/by-date/:date', (req, res) => {
   res.json({ newspaper: getNewspaperByDate(req.params.date) });
 });
 
-// POST /api/newspaper/generate — 手动补发今天的报纸（已存在则直接返回现有内容）
+// POST /api/newspaper/generate — 手动补发/补图今天的报纸（已存在则返回现有内容 + 顺带补图）
 router.post('/generate', async (req, res) => {
   const existing = getTodayNewspaperForFrontend();
   if (existing) {
-    res.json({ newspaper: existing, started: false });
+    // 2026-10-04 用户实测：「日报的图加载不出来」，点「手动补发」也没反应。
+    // 原因就是这里**直接 return** —— 报纸已在、只是配图缺失（出图当时 ComfyUI 没开）时，
+    // 手动入口等于不存在，用户没有任何补救手段。
+    // 现在照样把补图那一趟踢起来：`maybeGenerateDailyNewspaper` 对"今天已有报纸"走的分支
+    // 正是 `maybeRefillTodayImages`（服务里那行注释也写着"当天报纸已出：只剩补图一条路"）。
+    const task = maybeGenerateDailyNewspaper();
+    res.json({ newspaper: existing, started: false, refill: Boolean(task) });
     return;
   }
   const task = maybeGenerateDailyNewspaper();

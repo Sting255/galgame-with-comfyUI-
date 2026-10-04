@@ -15,6 +15,10 @@ import { config } from '../config.js';
 import { ensureFontForCharacter } from './handwritingFontService.js';
 import { createCharacterTownLifeContext } from './characterTownLifeContext.js';
 import { createTownActorRegistry } from './town/townActorRegistry.js';
+import {
+  isGroupMemoryLinkEnabled, listCharacterGroupConversationIds,
+  isGroupSourcedMemory, groupOriginPrefix, loadGroupNameMap,
+} from './groupMemoryLink.js';
 
 const CHECK_INTERVAL = 60 * 1000;
 
@@ -239,10 +243,8 @@ async function generateReplyData(charId, charName, charBasePrompt, userContent, 
     ).join('\n'));
   }
 
-  const memories = await hybridSearch(userContent, { conversationId: convId, topK: 3, timeoutMs: 15000 }).catch(() => []);
-  if (memories.length > 0) {
-    mat2Parts.push('【相关长期记忆】\n' + memories.map(m => `- [${m.memory_type || '记忆'}] ${m.judgment}`).join('\n'));
-  }
+  const memorySection = await buildMailboxMemorySection(charId, userContent);
+  if (memorySection) mat2Parts.push(memorySection);
 
   const latestSummary = db.prepare(`
     SELECT summary FROM rolling_summaries WHERE conversation_id = ? ORDER BY id DESC LIMIT 1
@@ -382,6 +384,70 @@ ${userContent}
     console.error('[mailboxScheduler] LLM reply error:', err.message);
     return null;
   }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  信件素材 · 长期记忆（本会话 + 她所在的群）
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * 给群出处补全群名：只在**确实缺名**（群名表里没有、或干脆没传表）时才查一次
+ * `group_chats`，查不到就让 `groupOriginPrefix` 退化成【群聊】。
+ * 纯只读、有界（只查缺的那些 id），群名只是锦上添花，失败不打断写信。
+ */
+function completeGroupNames(groupNames, groupIds = []) {
+  const missing = new Set();
+  for (const id of Array.isArray(groupIds) ? groupIds : []) {
+    const key = String(id ?? '');
+    if (key && !(groupNames instanceof Map && groupNames.has(key))) missing.add(key);
+  }
+  if (missing.size === 0) return groupNames instanceof Map ? groupNames : new Map();
+  try {
+    return new Map([...(groupNames instanceof Map ? groupNames : []), ...loadGroupNameMap([...missing])]);
+  } catch (err) {
+    console.warn('[mailboxScheduler] 群名补查失败，群出处退化成【群聊】:', err.message);
+    return groupNames instanceof Map ? groupNames : new Map();
+  }
+}
+
+/**
+ * 检索范围 = 本会话 + 她所在的全部群会话（复用 `groupMemoryLink.listCharacterGroupConversationIds`，
+ * 与私聊召回同一套口径，不新造并行检索）。记忆总开关关闭时不查群、也不检索。
+ */
+export function resolveMailboxMemoryScope(charId, db = getDb()) {
+  if (!isGroupMemoryLinkEnabled()) return { conversationIds: [`char_${charId}`], groupConversationIds: [] };
+  const groupConversationIds = listCharacterGroupConversationIds(charId, db);
+  return { conversationIds: [`char_${charId}`, ...groupConversationIds], groupConversationIds };
+}
+
+/**
+ * 检索命中 → 信件素材行。
+ * 非群来源的行与改动前逐字节一致（`- [${memory_type}] ${judgment}`）；
+ * 群来源的行在前面插 `【群聊·<群名>】` / `【群聊】` 标出出处（复用 `groupOriginPrefix`），
+ * 免得她把群里的记忆当成和用户私下的经历写进信里。
+ */
+export function formatMailboxMemoryLines(memories = [], { groupNames = new Map(), groupIds = [] } = {}) {
+  const list = Array.isArray(memories) ? memories : [];
+  // 没有群来源命中（含只有带「群聊」tag 的 H2 记忆）时一次 group_chats 都不查：
+  // 没有群记忆的角色，输出与加群记忆之前逐字节一致，也不多发一次查询。
+  const names = list.some(isGroupSourcedMemory) ? completeGroupNames(groupNames, groupIds) : groupNames;
+  return list.map(memory => {
+    const prefix = groupOriginPrefix(memory, names);
+    return `- ${prefix}[${memory?.memory_type || '记忆'}] ${memory?.judgment}`;
+  }).join('\n');
+}
+
+/**
+ * 写信时的「相关长期记忆」素材段（含标题行）。空结果返回 null —— 调用方据此不产空段。
+ * `search` 可注入，便于单测在不起服务/不联网的前提下断言检索范围与素材文本。
+ */
+export async function buildMailboxMemorySection(charId, userContent, { search = hybridSearch, topK = 3, timeoutMs = 15000, db = getDb() } = {}) {
+  if (!isGroupMemoryLinkEnabled()) return null;
+  const { conversationIds, groupConversationIds } = resolveMailboxMemoryScope(charId, db);
+  const memories = await search(userContent, { conversationIds, topK, timeoutMs }).catch(() => []);
+  if (!Array.isArray(memories) || memories.length === 0) return null;
+  const groupNames = groupConversationIds.length > 0 ? loadGroupNameMap(groupConversationIds, db) : new Map();
+  return `【相关长期记忆】\n${formatMailboxMemoryLines(memories, { groupNames, groupIds: groupConversationIds })}`;
 }
 
 // ══════════════════════════════════════════════════════════════

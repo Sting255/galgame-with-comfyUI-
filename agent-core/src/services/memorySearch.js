@@ -6,6 +6,28 @@ import { parseTags } from './memory/memoryRepository.js';
 
 const RRF_K = 60;
 
+/**
+ * 查询分词后保留的 token 数上限（默认值，**不要轻易改**）。
+ *
+ * 24 是私聊短句的既有口径：私聊那句"你上次说的那个"本来就没几个词，截断无感，
+ * 而放宽会让 FTS/ngram 的 OR 条件变长（每次检索最多几十个 LIKE）。群聊轮以前也吃这个默认值，
+ * 结果一句带多个主题的群话题后半句关键词被整段切掉（见 `groupChatEngine.GROUP_ROUND_QUERY_TOKEN_LIMIT`）。
+ * 需要更长的调用方自己传 `queryTokenLimit`（`hybridSearch` 的可选参数），不要改这里。
+ */
+export const QUERY_TOKEN_LIMIT_DEFAULT = 24;
+
+/**
+ * 送给**嵌入服务**的查询串长度上限（task-43）。
+ *
+ * 为什么需要：群聊轮会把整段「群聊记录」拼进查询串（groupChatEngine 的实况注入），
+ * 长到内置嵌入服务直接报 `The parameter is invalid`，那一轮就只剩纯文字检索、连重排也一起没了。
+ * 真机证据：`完整/新建文件夹/新建文件夹/backend-2026-09-29.log:147`（`fallback="embedding: 系统内置嵌入服务失败 (1/5)"`）。
+ *
+ * 口径：**只截断这一路**。文本检索 / 实体通道 / 重排仍吃完整 query —— 它们本来就各有自己的上限
+ * （见 QUERY_TOKEN_LIMIT_DEFAULT、AUDIT_QUERY_MAX_LENGTH）；短查询（私聊口径）永远碰不到这个上限。
+ */
+export const EMBED_INPUT_MAX_CHARS = 1200;
+
 export async function hybridSearch(query, options = {}) {
   const timeoutMs = options.timeoutMs;
   const run = (async () => {
@@ -15,9 +37,11 @@ export async function hybridSearch(query, options = {}) {
   const topK = clamp(options.topK ?? settings.topK, 1, 20);
   const textLimit = clamp(options.textCandidates ?? settings.textCandidates, topK, 100);
   const vectorLimit = clamp(options.vectorCandidates ?? settings.vectorCandidates, topK, 100);
-  const textResults = textSearch(query, conversationIds, textLimit, { includeHistorical: options.includeHistorical });
+  // 分词上限：默认保持 24（私聊口径不变），只有显式传参的调用点（群聊轮）才放宽
+  const queryTokenLimit = options.queryTokenLimit;
+  const textResults = textSearch(query, conversationIds, textLimit, { includeHistorical: options.includeHistorical, queryTokenLimit });
   // v3 实体通道（Mem0 平行实体集合思路）：查询词命中实体名/别名 → 反查关联记忆，作为独立信号参与 RRF
-  const entityResults = isMemoryV3Enabled() ? entitySearch(query, conversationIds, textLimit, { includeHistorical: options.includeHistorical }) : [];
+  const entityResults = isMemoryV3Enabled() ? entitySearch(query, conversationIds, textLimit, { includeHistorical: options.includeHistorical, queryTokenLimit }) : [];
   let profile = null;
   let embeddingSource = 'unknown';
   let embeddingElapsedMs = null;
@@ -34,7 +58,12 @@ export async function hybridSearch(query, options = {}) {
   // 此前两者同处一个 catch、一律标成 `embedding:`，导致"8765 没启动"被误报成"嵌入失败"，
   // 排查时会一路去查嵌入 provider，而真正缺席的是那个本地进程。
   try {
-    const embeddingResult = await embedMemoryText(query, settings);
+    // 嵌入输入上限（task-43）：群聊轮会把整段「群聊记录」拼进查询串，长到内置嵌入服务直接报
+    // `The parameter is invalid`（真机证据 完整/新建文件夹/新建文件夹/backend-2026-09-29.log:147 ——
+    // 那一轮被迫降级成纯文字检索 + 无重排）。嵌入只需要语义指纹，截断前缀完全够用。
+    // **只截断送给嵌入的输入**：textSearch / entitySearch / rerank 仍用完整 query，
+    // 短查询（私聊口径）逐字节不变。
+    const embeddingResult = await embedMemoryText(String(query ?? '').slice(0, EMBED_INPUT_MAX_CHARS), settings);
     profile = embeddingResult.profile;
     embeddingSource = embeddingResult.source;
     embeddingElapsedMs = embeddingResult.elapsedMs;
@@ -101,8 +130,8 @@ export async function hybridSearch(query, options = {}) {
   return run;
 }
 
-export function textSearch(query, conversationScope = null, limit = 20, { includeHistorical = false } = {}) {
-  const tokens = queryTokens(query);
+export function textSearch(query, conversationScope = null, limit = 20, { includeHistorical = false, queryTokenLimit = QUERY_TOKEN_LIMIT_DEFAULT } = {}) {
+  const tokens = queryTokens(query, queryTokenLimit);
   if (tokens.length === 0) return [];
   const conversationIds = normalizeConversationIds(null, conversationScope);
   const ftsResults = ftsSearch(tokens, conversationIds, limit, { includeHistorical });
@@ -184,9 +213,9 @@ function ngramSearch(tokens, conversationIds, limit, { includeHistorical = false
 
 // 实体通道：查询 token 命中实体（名字相等 > 互相包含 > 别名）→ 反查关联记忆，
 // 按实体命中分 × 链接角色权重（subject 3 / object 2 / mention 1）排序。
-function entitySearch(query, conversationIds, limit, { includeHistorical = false } = {}) {
+function entitySearch(query, conversationIds, limit, { includeHistorical = false, queryTokenLimit = QUERY_TOKEN_LIMIT_DEFAULT } = {}) {
   const db = getDb();
-  const tokens = queryTokens(query);
+  const tokens = queryTokens(query, queryTokenLimit);
   if (tokens.length === 0) return [];
   const matched = matchEntities(db, tokens);
   if (matched.length === 0) return [];
@@ -310,7 +339,15 @@ export function formatRow(row, source, score) {
   };
 }
 
-function queryTokens(query) {
+/**
+ * 查询 → 检索 token 列表（汉字段 + 其 2 字滑窗，英文/数字词整段）。
+ *
+ * `limit` 就是分词后的截断上限，**默认 `QUERY_TOKEN_LIMIT_DEFAULT`（24）保持不变**：
+ * 私聊召回与历史行为逐 token 一致。群聊轮那种"一句话带多个主题"的查询由
+ * `groupChatEngine.buildGroupRoundMemoryBlock` 显式传更大的值（见该常量的说明）。
+ * 非法值（0/负数/NaN）回退到默认值，保证永远不会变成"不截断"。
+ */
+export function queryTokens(query, limit = QUERY_TOKEN_LIMIT_DEFAULT) {
   const raw = String(query || '').toLowerCase().match(/[\p{Script=Han}]{2,}|[a-z0-9_+-]{2,}/gu) || [];
   const tokens = new Set();
   for (const token of raw) {
@@ -319,7 +356,8 @@ function queryTokens(query) {
       for (let i = 0; i < token.length - 1; i++) tokens.add(token.slice(i, i + 2));
     }
   }
-  return [...tokens].slice(0, 24);
+  const cap = Math.floor(Number(limit));
+  return [...tokens].slice(0, Number.isFinite(cap) && cap > 0 ? cap : QUERY_TOKEN_LIMIT_DEFAULT);
 }
 
 // 审计里保存的查询文本长度。curation 检索的"查询"是整段 40 条消息的 transcript，

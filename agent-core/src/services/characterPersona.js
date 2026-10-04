@@ -18,6 +18,12 @@
 
 import { getActiveOutfits } from './outfitService.js';
 import { config } from '../config.js';
+// 2026-10-02：她此刻戴着什么（跨场景可见）。走**注册表叶子**而不是直接 import toyService ——
+// toyService 本来就 import 本文件，反过来 import 会成环。
+import { wornToysBrief } from './wornToysBrief.js';
+// 人格裁剪抽在零依赖的叶子模块里：emotionEngine 反过来 import 本文件（它要用 buildCharacterPersona），
+// 所以这里**不能**直接 import emotionEngine（会成环，还会把 db/llm 拖进这个被 58 处引用的模块）。
+import { cropPersonalityForEmotion } from './personalityCrop.js';
 
 const APPEARANCE_HEADING_RE = /##\s*你的外观/;
 
@@ -55,20 +61,36 @@ export function extractAppearanceSection(basePrompt) {
  * @param {{limited?: Array<{name,description}>, exclusive?: {name,description}|null}} outfits
  * @returns {{lead: string, baseLabel: string, tail: string}|null} 无任何生效外观时返回 null
  */
-export function buildOutfitInjectionBlocks(outfits) {
+export function buildOutfitInjectionBlocks(outfits, opts = {}) {
   const limited = Array.isArray(outfits?.limited) ? outfits.limited : [];
   const exclusive = outfits?.exclusive || null;
   if (limited.length === 0 && !exclusive) return null;
 
+  // 归属（2026-10-02 用户：「角色的衣服容易串到一起」）：
+  //   下面这些话原本是**无主**的 ——「画面必须完整呈现以下全部要素」「着装裁定（优先级…）」。
+  //   单角色生图没问题；但多人同场（群聊成员卡 / 多人事件 / 朋友圈 / 梦境）时，
+  //   模型读到"画面必须完整呈现全部要素"就会**把限时服饰穿到所有人身上**，
+  //   并把各人的衣服配饰混着写 ⇒ 用户看到的正是"衣服串到一起"。
+  //   所以：只要调用方给了 owner（多角色路径都会给），每段都写上**这是谁的**，
+  //   并追加一条"不得混穿"的硬约束；**不给 owner 时输出与改动前逐字节一致**（单角色路径不受影响）。
+  const owner = String(opts?.owner || '').trim();
+  const own = owner ? `${owner}的` : '';
+
   const leadParts = [];
   if (limited.length > 0) {
     const lines = limited.map((o, i) => `${i + 1}. ${o.name}：${o.description}`);
-    leadParts.push(`【限时服饰（当前生效，优先级最高，多套同时叠加）——画面必须完整呈现以下全部要素】\n${lines.join('\n')}`);
+    const head = owner
+      ? `【${own}限时服饰（当前生效，优先级最高，多套同时叠加）——**只在描绘${owner}时**完整呈现以下全部要素，不要穿到同场其他角色身上】`
+      : '【限时服饰（当前生效，优先级最高，多套同时叠加）——画面必须完整呈现以下全部要素】';
+    leadParts.push(`${head}\n${lines.join('\n')}`);
   }
   if (exclusive) {
     // 只有专属形态时没有更高优先级，标注为最高
     const rank = limited.length > 0 ? '优先级次之' : '优先级最高';
-    leadParts.push(`【角色专属形态（当前生效，${rank}）——画面必须完整呈现以下全部要素】\n1. ${exclusive.name}：${exclusive.description}`);
+    const head = owner
+      ? `【${own}角色专属形态（当前生效，${rank}）——**只用在${owner}身上**，不要给同场其他角色】`
+      : `【角色专属形态（当前生效，${rank}）——画面必须完整呈现以下全部要素】`;
+    leadParts.push(`${head}\n1. ${exclusive.name}：${exclusive.description}`);
   }
 
   // 特殊外观指代与优先级说明按生效外观组合三选一（都无时本函数已返回 null，整段不注入）
@@ -77,20 +99,26 @@ export function buildOutfitInjectionBlocks(outfits) {
   const order = both
     ? '限时服饰 > 角色专属形态 > 基础外观'
     : (limited.length > 0 ? '限时服饰 > 基础外观' : '角色专属形态 > 基础外观');
-  const baseLabel = `【基础外观（仅用于填补${special}未提及的部位，与${special}冲突的描述无效）】`;
+  const baseLabel = owner
+    ? `【${own}基础外观（仅用于填补${special}未提及的部位，与${special}冲突的描述无效）】`
+    : `【基础外观（仅用于填补${special}未提及的部位，与${special}冲突的描述无效）】`;
 
   const replaceRule = both
-    ? `- 限时服饰与角色专属形态描写到的每个部位（发型、发色、服装、饰品、鞋袜等），其全部属性（颜色、长度、款式、材质）按上述优先级取最高者的描写，必须完全照此描绘——这是对基础外观对应部位的整体替换，不是叠加。`
-    : `- ${special}描写到的每个部位（发型、发色、服装、饰品、鞋袜等），其全部属性（颜色、长度、款式、材质）必须完全按${special}描绘——这是对基础外观对应部位的整体替换，不是叠加。`;
-  const tail = [
-    `【着装裁定（优先级：${order}，逐条执行）】`,
+    ? `- ${own}限时服饰与角色专属形态描写到的每个部位（发型、发色、服装、饰品、鞋袜等），其全部属性（颜色、长度、款式、材质）按上述优先级取最高者的描写，必须完全照此描绘——这是对基础外观对应部位的整体替换，不是叠加。`
+    : `- ${own}${special}描写到的每个部位（发型、发色、服装、饰品、鞋袜等），其全部属性（颜色、长度、款式、材质）必须完全按${special}描绘——这是对基础外观对应部位的整体替换，不是叠加。`;
+  const tailLines = [
+    owner ? `【${own}着装裁定（只适用于${owner}一个人；优先级：${order}，逐条执行）】` : `【着装裁定（优先级：${order}，逐条执行）】`,
     replaceRule,
-    `- 基础外观中与上述特殊外观同部位或相冲突的描述一律作废，禁止出现在画面与提示词中；尤其当特殊外观改变了发型或发色时，基础外观的原发型、原发色必须完全消失，不得再出现。`,
+    `- ${own}基础外观中与上述特殊外观同部位或相冲突的描述一律作废，禁止出现在画面与提示词中；尤其当特殊外观改变了发型或发色时，${own || ''}基础外观的原发型、原发色必须完全消失，不得再出现。`,
     // 刻意不把「发型」列进沿用基础外观的部位举例（发型/发色是最常被限时服饰改写的部位）
     `- 只有特殊外观完全未提及的部位（瞳色、五官、体型等）才沿用基础外观。`,
-  ].join('\n');
+  ];
+  // 多人同场专用硬约束：不加这句，模型会把各角色的衣服/配饰来回串（用户 2026-10-02 的反馈）
+  if (owner) {
+    tailLines.push(`- **以上整段只属于${owner}一个人**：同场其他角色穿什么、戴什么、什么发型，与${owner}无关；不要把别人的衣服饰品写到${owner}身上，也不要把${owner}的着装写到别人身上。`);
+  }
 
-  return { lead: leadParts.join('\n\n'), baseLabel, tail };
+  return { lead: leadParts.join('\n\n'), baseLabel, tail: tailLines.join('\n') };
 }
 
 /**
@@ -100,10 +128,14 @@ export function buildOutfitInjectionBlocks(outfits) {
  * @param {{lead, baseLabel, tail}|null} blocks buildOutfitInjectionBlocks 的返回值（null 时不做任何事）
  * @returns {string}
  */
-export function injectOutfitsIntoAppearance(appearance, blocks) {
+export function injectOutfitsIntoAppearance(appearance, blocks, opts = {}) {
   if (!blocks) return appearance;
   const { lead, baseLabel, tail } = blocks;
-  if (!appearance.trim()) return `## 你的外观\n${lead}\n\n${tail}`;
+  // 无外观段时的兜底标题：给了 owner 就写成「## 德丽莎的外观」，否则维持原来的「## 你的外观」
+  // （多人同场时"你的外观"会被读成"当前正在写的那个人的外观" ⇒ 正是衣服串味的入口之一）
+  const owner = String(opts?.owner || '').trim();
+  const fallbackHeading = owner ? `## ${owner}的外观` : '## 你的外观';
+  if (!appearance.trim()) return `${fallbackHeading}\n${lead}\n\n${tail}`;
   const headingEnd = appearance.indexOf('\n');
   if (headingEnd === -1) return `${appearance}\n${lead}\n\n${tail}`;
   const heading = appearance.slice(0, headingEnd);
@@ -203,7 +235,20 @@ export function isAppearanceOnlyPromptChange(oldBase, newBase) {
 export function buildCharacterAppearanceSection(character, opts = {}) {
   const outfits = resolveOutfits(character, opts.outfits);
   const appearance = extractAppearanceSection(character?.base_prompt);
-  return injectOutfitsIntoAppearance(appearance, buildOutfitInjectionBlocks(outfits));
+  // 多角色场景调用方会传 opts.person（角色名）⇒ 着装段带上归属，避免"衣服串到一起"；
+  // 不传时输出与改动前逐字节一致（单角色生图路径不受影响）
+  const owner = typeof opts.person === 'string' ? opts.person : '';
+  const withOutfits = injectOutfitsIntoAppearance(
+    appearance,
+    buildOutfitInjectionBlocks(outfits, { owner }),
+    { owner },
+  );
+  // 2026-10-02 跨场景穿戴可见（用户原话：「如果戴上玩具之后 没有摘下的情况下 在其他的地方出图也得要
+  // 看到玩具的所在…就算角色戴着玩具 但是就是没有出来玩具的图 这个是很不真实的」）——
+  // 外观段是所有生图路径的必经之处，玩具接在这里 ⇒ 私聊图 / 群聊图 / 朋友圈图 / 亲密图 / 立绘 /
+  // 报纸…全部自动带上。没戴（或玩具服务尚未加载）⇒ 空串 ⇒ 零注入、与改动前逐字节一致。
+  const toys = wornToysBrief(character?.id, { scene: opts.scene, person: owner });
+  return toys ? `${withOutfits}\n${toys}` : withOutfits;
 }
 
 function resolveOutfits(character, outfits) {
@@ -239,7 +284,7 @@ export function buildCharacterPersona(character, opts = {}) {
   if (variant === 'full') {
     const base = String(character?.base_prompt || character?.short_prompt || '');
     const appearance = extractAppearanceSection(base);
-    const injected = injectOutfitsIntoAppearance(appearance, buildOutfitInjectionBlocks(outfits));
+    const injected = injectOutfitsIntoAppearance(appearance, buildOutfitInjectionBlocks(outfits, { owner: person }), { owner: person });
     let result;
     if (appearance) {
       result = base.slice(0, base.length - appearance.length) + injected;
@@ -252,15 +297,30 @@ export function buildCharacterPersona(character, opts = {}) {
   }
 
   // short variant
+  // ⚠️ 2026-10-02：人格**不再读库里那份 `short_prompt`**。
+  //    历史原因：`cropPersonalityForEmotion` 旧口径把人格硬截成 200 字（真实数据：德丽莎整卡 2212 字
+  //    ⇒ 实际只有 200 字 = 9%，还切在半句上），而库里 8 个角色存的 `short_prompt` 正是那个旧口径的产物
+  //    ⇒ 群聊成员资料卡 / 梦境 system3 / 多角色参考 otherPersona / maibot 桥**全都吃不到裁剪修复**。
+  //    所以改成**运行时从 `base_prompt` 现裁**（与 `routes/characters.js` 同一口径），
+  //    既不用写库、不用迁移（用户存档一个字节不动），也顺手摆脱了"库里那份可能已被浓缩坏掉"的隐患。
+  //    兜底：`base_prompt` 为空或裁不出内容时，仍然退回库里那份 `short_prompt`（有总比没有好）。
   const basePrompt = String(character?.base_prompt || '');
-  const short = String(character?.short_prompt || '').trim();
+  const storedShort = String(character?.short_prompt || '').trim();
+  const displayName = String(character?.display_name || '').trim();
+  // 现裁结果**只顶替原来那份 short_prompt 的位置**：
+  //   · 这行本来有 short_prompt（真角色卡都是）⇒ 用人格现裁替换它（本债的目标）；
+  //   · 这行没有 short_prompt（小镇 NPC、只有 persona 的行）⇒ **保持旧口径**（人格留空、只用外观段）——
+  //     它们的 persona 常是一句人物速写，塞进"素材/外观需求"里是噪音（`townAssetRequest.test.js` 钉着这条）。
+  const short = storedShort
+    ? (basePrompt ? cropPersonalityForEmotion(basePrompt, person || displayName || 'assistant').trim() : '') || storedShort
+    : '';
   const appearance = extractAppearanceSection(basePrompt);
   if (!short && !appearance) {
     // short_prompt 与外观段皆空：兜底整卡（与旧 maibot/dreamService 口径一致），
     // 此时无处锚定注入，跳过外观注入
     return basePrompt.trim();
   }
-  let appearancePart = injectOutfitsIntoAppearance(appearance, buildOutfitInjectionBlocks(outfits)).trim();
+  let appearancePart = injectOutfitsIntoAppearance(appearance, buildOutfitInjectionBlocks(outfits, { owner: person }), { owner: person }).trim();
   appearancePart = toThirdPerson(appearancePart, person);
   return [short, appearancePart].filter(Boolean).join(joiner);
 }
@@ -293,7 +353,13 @@ export function buildImageCrossRefInfo(char, opts = {}) {
   }
 
   const appearance = extractAppearanceSection(base);
-  const injected = injectOutfitsIntoAppearance(appearance, buildOutfitInjectionBlocks(resolveOutfits(char, opts.outfits)));
+  // ★ 交叉参考**永远**带归属：这段是"画面里还有谁"的说明，多人同框时最容易被穿错衣服，
+  //   所以这里不做"可选 owner"——一律用 char.display_name 写清这是谁的着装。
+  const injected = injectOutfitsIntoAppearance(
+    appearance,
+    buildOutfitInjectionBlocks(resolveOutfits(char, opts.outfits), { owner: person }),
+    { owner: person },
+  );
   if (injected) {
     parts.push(toThirdPerson(injected, person));
   }
@@ -316,4 +382,54 @@ export function buildUserImageCrossRefInfo() {
   // 三项全空时不能返回空串：空块会让模型只看到标题行而自由发挥用户长相
   if (parts.length === 0) return '（用户未填写个人资料，按普通人处理）';
   return parts.join('；');
+}
+
+/**
+ * 玩家信息块（私聊 / 群聊的**唯一入口**）
+ * 2026-10-02 用户反馈：「角色对话还是有一些不遵从设定，和玩家的性别与自我描述」。
+ *
+ * 为什么必须收口到这一个函数：
+ *   原先私聊（`routes/chat.js` 的 `<user_info>`）与群聊（`services/groupChatEngine.js` 的「用户信息：」）
+ *   各拼一份，而且**都只是事实陈述**（"性别：男。其他说明：学校的老师"）；紧挨着的 `<user_relation>`
+ *   却写着"这个身份为最高优先级" ⇒ 模型自然把性别/自述当**参考资料**而不是**设定**，
+ *   于是出现"把玩家写成女生""用角色自己的身份替代玩家身份"这类跑偏。
+ *   所以这里除了拼事实，还必须带上**遵从约束**，并且私聊/群聊共用同一份措辞，避免两条链再次跑偏。
+ *
+ * 取舍（写在这儿免得以后有人改坏）：
+ *   · 字段缺失时**省略**该字段，不写"性别：未说明"这类空壳（空壳会被模型当成"确实未定"从而自由发挥）；
+ *   · 三项全空时也只保留"发言来自真实用户" + 遵从约束，不再要求调用方另行兜底；
+ *   · `opts.style` 只影响**称呼**：私聊按 prompt 里的 `user` 标记，群聊按群里显示的昵称；
+ *   · `opts.worldHint`（默认开）追加一句"世界观里的性别措辞按玩家性别理解" —— 用来抵消
+ *     部分世界观文本面向女性而玩家性别为男时的冲突（**只改提示词，不动 `world_settings` 数据**）。
+ *
+ * @param {{nickname?:string, gender?:string, persona?:string, appearance?:string}} [user] 传 `config.user`
+ * @param {{style?:'chat'|'group', worldHint?:boolean, displayName?:string}} [opts]
+ * @returns {string} 可直接塞进 prompt 的文本（不含外层标签，标签由调用方保留）
+ */
+export function buildUserInfoBlock(user = {}, opts = {}) {
+  // 只认字符串：`config.user.*` 都是文本字段，`null / undefined / 数字 / 对象` 一律当作"没填"，
+  // 否则 `appearance: 0` 会被 String() 变成 "外观特征：0" 这种空壳（单测③钉住了这条）。
+  const pick = (v) => (typeof v === 'string' ? v.trim() : '');
+  const style = opts.style === 'group' ? 'group' : 'chat';
+  const name = pick(opts.displayName) || pick(user?.nickname) || '用户';
+
+  const facts = [];
+  if (pick(user?.gender)) facts.push(`性别：${pick(user.gender)}`);
+  if (pick(user?.appearance)) facts.push(`外观特征：${pick(user.appearance)}`);
+  if (pick(user?.persona)) facts.push(`其他说明：${pick(user.persona)}`);
+
+  const who = style === 'group'
+    ? `群里标记为「${name}」的发言来自真实用户`
+    : `消息中标记为"user"的人是"${name}"`;
+
+  const lines = [facts.length ? `${who}。${facts.join('。')}` : who];
+  // 这一句是本次修复的核心：把玩家信息从"参考资料"升级为"必须遵从的设定"。
+  // ⚠️ 措辞与 `services/wakeService.js` 里同名构造器**逐字一致**（那边服务"叫醒/延迟回复"两条链，
+  //    这边服务"私聊/群聊"两条链）—— 同一个概念两份实现是可耻的，但两条链的**话术**绝不能不一样，
+  //    否则模型在不同场景收到不同口径，用户感知仍然是"时灵时不灵"。统一口径由收尾提交负责。
+  lines.push('以上是玩家本人的真实设定：性别、身份与自我描述以此为准，不要写成相反性别，也不要用你自己的性别或身份替代。');
+  if (opts.worldHint !== false) {
+    lines.push('（世界观里出现的性别措辞，一律按玩家自身的性别理解。）');
+  }
+  return lines.join(' ');
 }

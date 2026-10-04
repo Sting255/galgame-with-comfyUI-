@@ -11,7 +11,7 @@ import { getDb, getSystemRules, getSystemRulesWithWorld, getWorldSetting, getGlo
 import { chatSync as defaultChatSync } from '../../llm/llm-client.js';
 import { generateImageRaw as defaultGenerateImageRaw } from '../imageSkill.js';
 import { saveBase64Image } from '../imagePaths.js';
-import { recordCompletedImageTask } from '../imageTaskRecorder.js';
+import { recordCompletedImageTask, recordFailedImageTask } from '../imageTaskRecorder.js';
 import { broadcast as broadcastToUnified } from '../unifiedStreamBus.js';
 import { config } from '../../config.js';
 import { getTimeTag, getLightNoteWithWeather } from '../timeLight.js';
@@ -30,7 +30,7 @@ function toSQLite(iso) {
 export function collectTownNpcDayFacts(db, npc) {
   const encodedId = -npc.id; // town_encounters.char_a/char_b：NPC 取负、角色取正
   const encounters = db.prepare(`
-    SELECT e.id, e.summary, l.name AS location_name
+    SELECT e.id, COALESCE(NULLIF(e.polished_summary, ''), e.summary) AS summary, l.name AS location_name
     FROM town_encounters e LEFT JOIN town_locations l ON l.id = e.location_id
     WHERE e.status = 'done' AND e.summary != ''
       AND (e.char_a = ? OR e.char_b = ?)
@@ -235,9 +235,28 @@ ${weatherHint}`;
         workflowTemplate: genResult.wfMode,
         db,
       });
+    } else {
+      // 2026-10-01：失败落库（原来连 warn 都没有，库里零痕迹）
+      recordFailedImageTask({
+        conversationId: `town_npc_${npc.id}_moments`,
+        promptOriginal: imagePrompt,
+        errorMessage: genResult.error || 'ComfyUI 未返回图片',
+        style: config.comfyui.momentsArtist,
+        resolution: `${config.comfyui.momentsWidth}x${config.comfyui.momentsHeight}`,
+        workflowTemplate: genResult.wfMode || null,
+        db,
+      });
     }
   } catch (err) {
     console.error(`[npcMoments] Image failed for ${npc.display_name}:`, err.message);
+    recordFailedImageTask({
+      conversationId: `town_npc_${npc.id}_moments`,
+      promptOriginal: imagePrompt,
+      errorMessage: err.message,
+      style: config.comfyui.momentsArtist,
+      resolution: `${config.comfyui.momentsWidth}x${config.comfyui.momentsHeight}`,
+      db,
+    });
   }
 
   // 5. 完成 + 下次发帖时间

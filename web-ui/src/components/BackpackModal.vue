@@ -50,8 +50,8 @@
 
             <!-- ── Right: 道具网格 ── -->
             <div class="items-panel">
-              <Transition name="effects-panel">
-                <section class="active-effects" aria-labelledby="active-effects-title">
+              <!-- 无条件渲染（空态/加载态都在 section 内部分支），外层不需要 Transition 壳 -->
+              <section class="active-effects" aria-labelledby="active-effects-title">
                   <div class="effects-heading">
                     <div class="effects-heading-main">
                       <span class="effects-heading-icon" aria-hidden="true">
@@ -119,7 +119,6 @@
                     <span>目前没有正在生效的效果</span>
                   </div>
                 </section>
-              </Transition>
 
               <div v-if="store.loading && store.items.length === 0" class="loading-state">
                 <span class="loading-spinner"></span>
@@ -209,6 +208,11 @@
     </Transition>
   </Teleport>
 
+  <!-- ── 催眠手机面板：背包里「使用」手机时改开这里，而不是走通用道具流程 ── -->
+  <linshe-modal v-model="hypnosisPhone.open" title="催眠手机">
+    <HypnosisPhonePanel v-if="hypnosisPhone.character" :character="hypnosisPhone.character" />
+  </linshe-modal>
+
   <!-- ── 全屏开箱演出（蓄力 → 图片生成完毕 → 开盖揭示） ── -->
   <!-- 礼物叙事：把小镇货摊买来的道具送给角色，图片 + 描述沿用小镇服务/打工的胶片样式 -->
   <TownServiceStage :open="giftStage.open" :session="giftStage.session" @close="giftStage.open = false" />
@@ -232,6 +236,8 @@ import ChestSvg from './ChestSvg.vue'
 import ItemFallbackIcon from './ItemFallbackIcon.vue'
 import ChestRevealOverlay from './ChestRevealOverlay.vue'
 import TownServiceStage from './town/TownServiceStage.vue'
+import LinsheModal from './ui/LinsheModal.vue'
+import HypnosisPhonePanel from './HypnosisPhonePanel.vue'
 import { useBackpackActions, ITEM_KIND_LABELS as KIND_LABELS } from '../composables/useBackpackActions.js'
 
 const props = defineProps({
@@ -253,6 +259,7 @@ const {
   removingEffectId, onRemoveEffect,
   detailItem, openDetail, startUse, giftStage,
   showCharPicker, pendingItem, cancelPick, pickCharacter,
+  hypnosisPhone,
   onDiscard, resetUi,
 } = useBackpackActions({
   confirm: (opts) => confirmRef.value.show(opts),
@@ -786,10 +793,7 @@ function close() {
 .item-list-leave-to { opacity: 0; transform: scale(0.9); }
 .item-list-move { transition: transform 0.3s cubic-bezier(0.22, 0.61, 0.36, 1); }
 
-.effects-panel-enter-active,
-.effects-panel-leave-active { transition: opacity 0.3s ease, transform 0.3s ease; }
-.effects-panel-enter-from,
-.effects-panel-leave-to { opacity: 0; transform: translateY(-6px); }
+/* effects-panel 过渡壳已删（section 无条件渲染，过渡永不触发）；effect-list 的 TransitionGroup 过渡在下方 */
 
 .effect-list-enter-active,
 .effect-list-leave-active { transition: opacity 0.3s ease, transform 0.3s ease; }

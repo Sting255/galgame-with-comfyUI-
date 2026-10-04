@@ -2,7 +2,6 @@ import { getDb } from '../db/index.js';
 import { replaceWeatherHourlyCache } from './weatherHourlyCache.js';
 import { captureWeatherSource, assertWeatherSourceCurrent, beginWeatherForecastRequest, assertWeatherForecastCurrent } from './weatherSource.js';
 import { config } from '../config.js';
-import { getTimeLight } from './timeLight.js';
 import * as jose from 'jose';
 
 const _a = '5a55721f1d70713031111260607d21390b771079712e55721f1d1f3e3a3b6b71716375003a0e6b747906210f1d7179777d3b101c6b42451b240967706a427d4517256174007d1c361e547f40775c0036195675421500666a51627c3572721f1d1f1932361b1260607d21390b771079712e55721f1d1f';
@@ -288,57 +287,13 @@ export async function triggerUpdate() {
   }
 }
 
-export function getResolvedCity() {
-  if (!resolvedCitySource) return null;
-  const current = captureWeatherSource();
-  if (current.sourceKey !== resolvedCitySource.sourceKey || current.revision !== resolvedCitySource.revision) return null;
-  return resolvedCity;
-}
-
-export function getSeason(month) {
-  if (month >= 3 && month <= 5) return '春';
-  if (month >= 6 && month <= 8) return '夏';
-  if (month >= 9 && month <= 11) return '秋';
-  return '冬';
-}
-
-export function getCurrentWeather(datetime = new Date()) {
-  const timeStr = `${String(datetime.getHours()).padStart(2, '0')}:00`;
-
-  const row = getDb().prepare(
-    'SELECT weather_text, temperature, wind_speed FROM weather_hourly WHERE weather_time = ?'
-  ).get(timeStr);
-
-  if (!row) return null;
-
-  const hour = datetime.getHours();
-  const isNight = hour >= 18 || hour < 6;
-  let weatherText = row.weather_text;
-  if (isNight && weatherText === '晴') {
-    weatherText = '月朗星稀';
-  }
-
-  return {
-    weather: weatherText,
-    temperature: row.temperature,
-    windSpeed: row.wind_speed,
-  };
-}
-
-export async function getWeatherContext(now = new Date()) {
-  const timeLight = getTimeLight(now);
-  const season = getSeason(now.getMonth() + 1);
-  let weather = null;
-  try {
-    weather = getCurrentWeather(now);
-  } catch {}
-
-  return {
-    timeStr: timeLight.timeStr,
-    timeDesc: timeLight.timeDesc,
-    hour: timeLight.hour,
-    season,
-    lightNote: timeLight.lightNote,
-    weather,
-  };
-}
+// ── 2026-10-01 删除四个**全树零调用**的读函数 ────────────────────────────────
+// 删掉的：`getResolvedCity` / `getSeason` / `getCurrentWeather` / `getWeatherContext`。
+// 依据（都实核过）：
+//   · 只有 `config.js` 从这里 import，而且只 import `restartWeatherScheduler` / `triggerUpdate`；
+//   · 这四个符号在整个 src/test/web-ui/e2e 里除了自身定义**没有任何引用**；
+//   · 它们每一个都是 `timeLight.js` 里同名/等义函数的**第二份实现**（且 getSeason 的返回值还不一样：
+//     这里返回 `春`，timeLight 返回 `春天`）—— 典型的「两处真相」。
+// ⚠️ 其中 `getCurrentWeather` 里那段**夜间「晴 → 月朗星稀」改写是唯一一份**，
+//    删之前已经搬进 `timeLight.getCurrentWeather`（真正在跑的那条链），否则晴朗夜晚
+//    所有角色抬头看天都只会说「晴」。搬完才删，别把功能一起删掉。

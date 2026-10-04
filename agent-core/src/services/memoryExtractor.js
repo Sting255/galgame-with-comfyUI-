@@ -1,12 +1,12 @@
 import { getDb } from '../db/index.js';
 import { chatSync } from '../llm/llm-client.js';
 import { hybridSearch } from './memorySearch.js';
-import { applyMemoryActions, getCheckpoint, setCheckpoint } from './memory/memoryRepository.js';
+import { applyMemoryActions, getCheckpoint, setCheckpoint, validateMemoryAction } from './memory/memoryRepository.js';
 import { isMemoryV3Enabled } from './memory/memoryConfig.js';
 import { buildAnalysisUserContent, buildChatLogLines, buildSharedAnalysisSystemPrompt, wrapChatLogBlock } from './chatLogPrompt.js';
 
 const conversationQueues = new Map();
-const CURATE_EVERY_N_MESSAGES = 40; // 每 40 句整理一次长期记忆
+export const CURATE_EVERY_N_MESSAGES = 40; // 每 40 句整理一次长期记忆
 // 输出预算：v3 一条记忆实测约 250~350 token，旧的 3000 会在写到第 8 条时被 max_tokens 砍断，
 // 输出变成半截 JSON（Unterminated string）→ 解析失败 → 整理反复重试、checkpoint 不前进。
 const CURATION_MAX_TOKENS = 6000;
@@ -98,9 +98,31 @@ async function curateNow({ conversationId, throughRawMsgId, characterName = '', 
       });
       actions = parseMemoryActions(strict);
     }
-    const saved = applyMemoryActions({ conversationId, sourceRawStartId: startId, sourceRawEndId: endId, sourceMessageId, actions, eventTime });
+    // 逐条筛查 + 逐条落库（真机 E2E 抓到的 `curation failed: judgment 不能为空`）：
+    // 一条坏动作只丢它自己；不再让整批 curation 失败、checkpoint 原地打转。
+    const plan = planMemoryActionApply(actions);
+    if (plan.skipped.length > 0) {
+      const byReason = plan.skipped.reduce((acc, item) => {
+        acc[item.reason] = (acc[item.reason] || 0) + 1;
+        return acc;
+      }, {});
+      console.warn(`[memoryExtractor] 记忆动作筛查: 可用 ${plan.applicable.length} 条 / 跳过 ${plan.skipped.length} 条 ${JSON.stringify(byReason)} | 首条=${JSON.stringify(plan.skipped[0].detail)}`);
+    }
+    const saved = [];
+    let applySkipped = 0;
+    for (const item of plan.applicable) {
+      try {
+        saved.push(...applyMemoryActions({
+          conversationId, sourceRawStartId: startId, sourceRawEndId: endId, sourceMessageId, actions: [item], eventTime,
+        }));
+      } catch (err) {
+        // 单条落库失败（例如引用的旧记忆已失效、敏感内容被拒）也只跳过它自己
+        applySkipped += 1;
+        console.warn('[memoryExtractor] 单条记忆动作落库失败，已跳过:', String(err.message).slice(0, 200));
+      }
+    }
     setCheckpoint(conversationId, endId, 'idle', null);
-    console.log(`[memoryExtractor] curated ${saved.length} memories for ${conversationId}, raw ${startId}-${endId}`);
+    console.log(`[memoryExtractor] curated ${saved.length} memories for ${conversationId}, raw ${startId}-${endId}` + (applySkipped > 0 ? `, skipped ${applySkipped}` : ''));
     return saved;
   } catch (error) {
     setCheckpoint(conversationId, checkpoint.last_raw_msg_id, 'failed', String(error.message).slice(0, 500));
@@ -193,6 +215,83 @@ export function parseMemoryActions(raw) {
   return actions.slice(0, CURATION_MAX_ACTIONS);
 }
 
+/**
+ * 单条记忆动作的形态修复（纯函数）。
+ *
+ * 真机 E2E 抓到过既有故障：`[memoryExtractor] curation failed: judgment 不能为空`。
+ * 根因有二，都在**模型输出的形态**上，不在业务逻辑：
+ *   1. **扁平形态**：v3 的格式是 `{"action":"create","sourceMemoryIds":[],"memory":{...}}`，
+ *      模型偶尔把 memory 里的字段（memoryType/judgment/tags…）直接写在 action 这一层，
+ *      于是 `input.memory === undefined` → `normalizeMemory({})` → judgment 为空 → 抛错；
+ *   2. **judgment 写空**：模型留了 `"judgment":""` 或者只写了 reasoning。
+ * `applyMemoryActions` 是**整批先校验再开事务**（memoryRepository.js:143），所以上面任意一条
+ * 都会让**整批 curation 失败**、checkpoint 原地不动、下一轮再烧一次 LLM 又同样失败。
+ * 这里先把形态救回来（扁平 → 套回 memory、action 缺失按 sourceMemoryIds 数量推断），
+ * 救不回来的交给 planMemoryActionApply 丢弃。
+ *
+ * @returns {{action:'create'|'update'|'merge', sourceMemoryIds:string[], memory:object}|null}
+ */
+export function normalizeMemoryActionShape(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const rawMemory = entry.memory;
+  const hasWrapped = rawMemory && typeof rawMemory === 'object' && !Array.isArray(rawMemory);
+  // 扁平形态：把 action/sourceMemoryIds 之外的同级字段当成 memory 本体
+  const flat = {};
+  for (const [key, value] of Object.entries(entry)) {
+    if (key === 'memory' || key === 'action' || key === 'sourceMemoryIds' || key === 'source_memory_ids') continue;
+    flat[key] = value;
+  }
+  let memory = hasWrapped ? rawMemory : flat;
+  if (!memory || Object.keys(memory).length === 0) return null;
+  // 拼写变体：模型偶尔写 judgement（英式）；不归一的话同样会变成 "judgment 不能为空"
+  if (!String(memory.judgment ?? '').trim() && String(memory.judgement ?? '').trim()) {
+    memory = { ...memory, judgment: memory.judgement };
+  }
+  const sourceMemoryIds = [...new Set(
+    (Array.isArray(entry.sourceMemoryIds) ? entry.sourceMemoryIds
+      : Array.isArray(entry.source_memory_ids) ? entry.source_memory_ids : [])
+      .map(String).map(s => s.trim()).filter(Boolean)
+  )];
+  let action = String(entry.action ?? '').trim().toLowerCase();
+  if (!['create', 'update', 'merge'].includes(action)) {
+    // 模型没写 action（或写歪了）时按引用条数推断：0 条 = 新记忆，1 条 = 替代，≥2 条 = 合并
+    action = sourceMemoryIds.length === 0 ? 'create' : (sourceMemoryIds.length === 1 ? 'update' : 'merge');
+  }
+  return { action, sourceMemoryIds, memory };
+}
+
+/**
+ * 逐条筛查"这批记忆动作里哪些能落库"（纯函数，单测可直接喂合成样本）。
+ *
+ * 与 memoryRepository 的整批校验互补：这里**逐条**过 `validateMemoryAction`，
+ * 坏的那条只丢自己（记 reason），不连坐整批；幸存者由调用方逐条落库。
+ * 这样"宁可少一条记忆，也不要整批 curation 失败"。
+ *
+ * @param {Array} actions 模型输出的原始 memoryActions
+ * @param {{validate?:Function}} [options] 校验器（默认 memoryRepository.validateMemoryAction）
+ * @returns {{applicable:Array<{action,sourceMemoryIds,memory}>, skipped:Array<{reason:string,detail:string}>}}
+ */
+export function planMemoryActionApply(actions, { validate = validateMemoryAction } = {}) {
+  const list = Array.isArray(actions) ? actions : [];
+  const applicable = [];
+  const skipped = [];
+  for (const entry of list) {
+    const shape = normalizeMemoryActionShape(entry);
+    if (!shape) {
+      skipped.push({ reason: 'shape_unrecoverable', detail: JSON.stringify(entry ?? null).slice(0, 160) });
+      continue;
+    }
+    try {
+      const validated = validate(shape);
+      applicable.push(validated);
+    } catch (err) {
+      const reason = /judgment 不能为空/.test(String(err?.message)) ? 'judgment_empty' : 'invalid';
+      skipped.push({ reason, detail: String(err?.message || err).slice(0, 160) });
+    }
+  }
+  return { applicable, skipped };
+}
+
 // 旧调用兼容；新代码应传 raw assistant id。
 
 export async function curateAccumulatedMemory({ accumulatedText, characterName = '', userName = '用户' }) {
@@ -207,9 +306,11 @@ export async function curateAccumulatedMemory({ accumulatedText, characterName =
   const actions = parseMemoryActions(raw);
   const lines = actions
     .map((item) => {
-      const memory = item?.memory ?? {};
+      // 同样先修形态：扁平形态（字段写在 action 同级）在旧代码里会输出 '- [knowledge]' 这种空行
+      const memory = normalizeMemoryActionShape(item)?.memory ?? {};
       const type = memory.memoryType ?? 'knowledge';
-      return `- [${type}] ${memory.judgment ?? ''}`.trim();
+      const judgment = String(memory.judgment ?? '').trim();
+      return judgment ? `- [${type}] ${judgment}` : '';
     })
     .filter(Boolean);
   return lines.length > 0 ? lines.join('\n') : '';

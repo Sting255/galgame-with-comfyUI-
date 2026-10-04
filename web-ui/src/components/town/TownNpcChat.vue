@@ -3,6 +3,8 @@
     :player-portrait-url="playerPortraitUrl" :messages="messages" :loading="loading" :sending="sending"
     :blocked="blocked || serviceBusy || admissionBusy || giftBusy || interactionBusy" :status="serviceBusy || admissionBusy ? '正在提供服务，请稍后再交谈。' : ''" :error="error" :retryable="retryable" :draft-restore="draftRestore"
     :chat-active="chatActive" :actions="actions" @action="onAction"
+    :status-line="statusLine"
+    @open-status="$emit('open-status')" @open-activity="$emit('open-activity')"
     @send="send" @retry="retry" @reload="load" @close="$emit('close')">
     <template #message="{ message }">
       <p>{{ message.content }}</p>
@@ -26,8 +28,10 @@ import { npcTurnKey, getNpcPendingTurn, createNpcPendingTurn, forgetNpcPendingTu
 import TownDialogueStage from './TownDialogueStage.vue'
 import TownResidentActions from './TownResidentActions.vue'
 import TownVnChoice from './TownVnChoice.vue'
-const props = defineProps({ npcId: { type: Number, required: true }, displayName: String, playerName: String, worldId: String, worldEpoch: Number, serviceBusy: Boolean })
-const emit = defineEmits(['close', 'character-chat', 'context-invalid', 'story'])
+const props = defineProps({ npcId: { type: Number, required: true }, displayName: String, playerName: String, worldId: String, worldEpoch: Number, serviceBusy: Boolean,
+  statusLine: { type: String, default: '' },
+ })
+const emit = defineEmits(['close', 'character-chat', 'context-invalid', 'story', 'open-status', 'open-activity'])
 const interactionBusy = ref(false)
 // 对话模式：点「聊聊近况」后才出现输入框与聊天记录，其余功能长条先收起
 const chatActive = ref(false)
@@ -123,8 +127,8 @@ async function run(turn) {
       error.value = err.code === 'DIALOGUE_PROCESSING' ? '邻居仍在回应，可稍后重试同一条消息。' : `未能确认发送结果（${turn.text}）。可重试同一条消息查看结果。`
     }
   } finally {
-    if (current !== generation) return
-    sending.value = false
+    // 不用 return：finally 里的 return 会吞掉 try/catch 抛出的异常（eslint no-unsafe-finally）
+    if (current === generation) sending.value = false
   }
 }
 function onTalk(text) {

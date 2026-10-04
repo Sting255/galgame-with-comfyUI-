@@ -1,15 +1,24 @@
-@font-face {
-  font-family: 'HarmonyOS Sans SC';
-  src: url('./HarmonyOS_Sans_SC_Regular.woff2') format('woff2');
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: 'HarmonyOS Sans SC';
-  src: url('./HarmonyOS_Sans_SC_Bold.woff2') format('woff2');
-  font-weight: 700;
-  font-style: normal;
-  font-display: swap;
-}
+/* 字体入口（2026-10-02 改为按 unicode-range 分块）
+ *
+ * 以前这里直接引两个整包：
+ *   HarmonyOS_Sans_SC_Regular.woff2  4.26 MB
+ *   HarmonyOS_Sans_SC_Bold.woff2     4.37 MB
+ * ⇒ 首屏要把 8.6 MB 全下完才用得上正确字体（font-display: swap 只是不至于白屏）。
+ *
+ * 现在用**项目自带的** cn-font-split（web-ui 的依赖，本来就有）把两个字重各切成 ~164 个
+ * unicode-range 分块：浏览器只下当前页面**真正用到的字**所在的那几块（单块最大 71 KB）；
+ * 且保留了**全部字形**（不是子集化）⇒ 角色名 / 你的昵称 / 模型生成的新词都不会变方块。
+ * 声明与原来完全一致（同 family、400/700、font-style: normal、font-display: swap）⇒ 零视觉变化。
+ *
+ * 代价：分块合计约 5.3 MB/字重（比整包多 ~1 MB，小块各自压缩效率略低）——
+ * 换来的是**下载量**从 8.6 MB 降到几百 KB；磁盘/包体多出的 ~2 MB 对 800 MB 的包可忽略。
+ *
+ * 重新生成（换字体或升级 cn-font-split 时）：
+ *   cd web-ui
+ *   node_modules\.bin\cn-font-split -i src\assets\fonts\HarmonyOS_Sans_SC_Regular.woff2 -o src\assets\fonts\split\Regular
+ *   node_modules\.bin\cn-font-split -i src\assets\fonts\HarmonyOS_Sans_SC_Bold.woff2    -o src\assets\fonts\split\Bold
+ * 随后：删掉各目录里的 index.html / index.proto / reporter.bin，把 result.css 改名为 harmony-*.css。
+ * 回归守卫见 web-ui/test/fontSplit.test.js（引错整包 / 缺分块 / 缺 unicode-range 都会红）。
+ */
+@import './split/Regular/harmony-regular.css';
+@import './split/Bold/harmony-bold.css';

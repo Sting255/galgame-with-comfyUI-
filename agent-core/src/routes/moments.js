@@ -8,7 +8,7 @@ import { charArtistOverrideWithFallback } from '../services/characterImageOpts.j
 import { buildCharacterPersona } from '../services/characterPersona.js';
 import { createCharacterTownLifeContext } from '../services/characterTownLifeContext.js';
 import { createTownActorRegistry } from '../services/town/townActorRegistry.js';
-import { recordCompletedImageTask } from '../services/imageTaskRecorder.js';
+import { recordCompletedImageTask, recordFailedImageTask } from '../services/imageTaskRecorder.js';
 import { broadcast as broadcastToUnified } from '../services/unifiedStreamBus.js';
 import { getTimeTag, getLightNoteWithWeather } from '../services/timeLight.js';
 import { getCurrentActivity } from '../services/scheduleManager.js';
@@ -466,7 +466,20 @@ async function generateMomentImages(character, imagePrompts, opts = {}) {
           ...loraOpts,
         });
 
-        if (!genResult.success || genResult.images.length === 0) continue;
+        if (!genResult.success || genResult.images.length === 0) {
+          // 2026-10-01：失败要落库（原来只 `continue`，库里零痕迹 ⇒ 事后分不出
+          // 「没触发配图 / 生成失败 / 文件被导入弄丢」，用户一律报成「生不出来」）
+          recordFailedImageTask({
+            conversationId: `char_${character.id}_moments`,
+            promptOriginal: imagePrompts[i],
+            errorMessage: genResult.error || 'ComfyUI 未返回图片',
+            style: charArtist !== null ? charArtist : config.comfyui.momentsArtist,
+            resolution: `${width}x${height}`,
+            workflowTemplate: genResult.wfMode || null,
+            db,
+          });
+          continue;
+        }
 
         const usedPrompt = genResult.promptRefined || imagePrompts[i];
         usedPrompts.push(usedPrompt);
@@ -491,6 +504,14 @@ async function generateMomentImages(character, imagePrompts, opts = {}) {
         });
       } catch (err) {
         console.error(`[moments] Image ${i + 1}/${imagePrompts.length} failed for post ${postId}:`, err.message);
+        recordFailedImageTask({
+          conversationId: `char_${character.id}_moments`,
+          promptOriginal: imagePrompts[i],
+          errorMessage: err.message,
+          style: charArtist !== null ? charArtist : config.comfyui.momentsArtist,
+          resolution: `${width}x${height}`,
+          db,
+        });
       }
     }
   } catch (err) {
@@ -528,7 +549,18 @@ async function generateTownNpcMomentImages(npc, imagePrompts, opts = {}) {
           scene: 'moments',
           priority: 'high',
         });
-        if (!genResult.success || genResult.images.length === 0) continue;
+        if (!genResult.success || genResult.images.length === 0) {
+          recordFailedImageTask({
+            conversationId: `town_npc_${npc.id}_moments`,
+            promptOriginal: imagePrompts[i],
+            errorMessage: genResult.error || 'ComfyUI 未返回图片',
+            style: config.comfyui.momentsArtist,
+            resolution: `${width}x${height}`,
+            workflowTemplate: genResult.wfMode || null,
+            db,
+          });
+          continue;
+        }
 
         const usedPrompt = genResult.promptRefined || imagePrompts[i];
         usedPrompts.push(usedPrompt);
@@ -552,6 +584,14 @@ async function generateTownNpcMomentImages(npc, imagePrompts, opts = {}) {
         });
       } catch (err) {
         console.error(`[moments] NPC image ${i + 1}/${imagePrompts.length} failed for post ${postId}:`, err.message);
+        recordFailedImageTask({
+          conversationId: `town_npc_${npc.id}_moments`,
+          promptOriginal: imagePrompts[i],
+          errorMessage: err.message,
+          style: config.comfyui.momentsArtist,
+          resolution: `${width}x${height}`,
+          db,
+        });
       }
     }
   } catch (err) {

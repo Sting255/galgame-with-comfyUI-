@@ -96,6 +96,28 @@ export const SETTING_TO_CONFIG = {
   feature_townLLM:                   { obj: 'features', key: 'townLLM',               type: 'bool' },
   feature_townAutoLLM:               { obj: 'features', key: 'townAutoLLM',           type: 'bool' },
   feature_bgmMuted:                  { obj: 'features', key: 'bgmMuted',              type: 'bool' },
+  feature_intimate:                  { obj: 'features', key: 'intimate',              type: 'bool' },
+  feature_intimateBackfill:          { obj: 'features', key: 'intimateBackfill',      type: 'bool' },
+  feature_hypnosis:                  { obj: 'features', key: 'hypnosis',              type: 'bool' },
+  feature_antiRepetition:            { obj: 'features', key: 'antiRepetition',         type: 'bool' },
+  feature_antiRepetitionLock:        { obj: 'features', key: 'antiRepetitionLock',     type: 'bool' },
+  feature_antiRepetitionEscalation:  { obj: 'features', key: 'antiRepetitionEscalation', type: 'bool' },
+  feature_antiRepetitionReroll:      { obj: 'features', key: 'antiRepetitionReroll',     type: 'bool' },
+  feature_touch:                     { obj: 'features', key: 'touch',                  type: 'bool' },
+  feature_touchInstant:              { obj: 'features', key: 'touchInstant',           type: 'bool' },
+  feature_touchGroupAdult:           { obj: 'features', key: 'touchGroupAdult',        type: 'bool' },
+  feature_touchImageMode:            { obj: 'features', key: 'touchImageMode',         type: 'string' },
+  // 出图判定配额（2026-10-01）：同一会话连续几轮"她要图"都没成就不再判定；默认 6（原硬编码 3）
+  feature_imageJudgeQuota:           { obj: 'features', key: 'imageJudgeQuota',        type: 'int'    },
+  // 动作出图概率缩放（2026-10-01）：智能档基础概率整体乘这个系数（默认 1，夹到 ≤1 的结果）
+  feature_touchImageChanceScale:     { obj: 'features', key: 'touchImageChanceScale',  type: 'float'  },
+  // 性爱交互姿势（2026-10-01）：默认开；关掉时推进动作一律 409（读状态不拦）
+  feature_intimateActions:           { obj: 'features', key: 'intimateActions',        type: 'bool'   },
+  feature_touchBystanderChance:      { obj: 'features', key: 'touchBystanderChance',    type: 'float'  },
+  feature_touchReactionMode:         { obj: 'features', key: 'touchReactionMode',        type: 'string' },
+  feature_hiresQuality:              { obj: 'features', key: 'hiresQuality',             type: 'string' },
+  // 2026-09-30 三期玩具系统：不注册这里的话 setSetting('feature_toys') 重启后会丢（真机日志已 warn）
+  feature_toys:                      { obj: 'features', key: 'toys',                   type: 'bool' },
   feature_groupIdleBudget:           { obj: 'features', key: 'groupIdleBudget',        type: 'int'  },
   feature_deepThinkMode:             { obj: 'features', key: 'deepThinkMode',          type: 'bool' },
   group_activity: { obj: 'groupChat', key: 'activity', type: 'int' },
@@ -109,6 +131,8 @@ export const SETTING_TO_CONFIG = {
   user_appearance:                 { obj: 'user',     key: 'appearance',        type: 'string' },
   user_persona:                    { obj: 'user',     key: 'persona',           type: 'string' },
   workflow_mode:                   { obj: 'workflow',key: 'mode',             type: 'string' },
+  // 模式来源：manual = 用户在设置页手动选过（自动探测不再覆盖）；auto = 由模型目录自动对齐
+  workflow_mode_source:            { obj: 'workflow',key: 'modeSource',       type: 'string' },
   comfy_global_lora:              { obj: 'comfyui',  key: 'globalLora',       type: 'json' },
   comfy_hires_workflow_mode: { obj: 'comfyui', key: 'hiresWorkflowMode', type: 'string' },
   comfy_hires_upscale_model: { obj: 'comfyui', key: 'hiresUpscaleModel', type: 'string' },
@@ -117,6 +141,7 @@ export const SETTING_TO_CONFIG = {
   comfy_hires_source_blend:       { obj: 'comfyui', key: 'hiresSourceBlend', type: 'float' },
   comfy_hires_lora:               { obj: 'comfyui',  key: 'hiresLora',        type: 'json' },
   comfy_hires_steps:              { obj: 'comfyui',  key: 'hiresSteps',       type: 'int'   },
+  comfy_hires_turbo:              { obj: 'comfyui',  key: 'hiresTurbo',       type: 'bool'  },
   comfy_hires_cfg:                { obj: 'comfyui',  key: 'hiresCfg',         type: 'float' },
   comfy_hires_denoise:            { obj: 'comfyui',  key: 'hiresDenoise',     type: 'float' },
   comfy_hires_max_size:           { obj: 'comfyui',  key: 'hiresMaxSize',     type: 'int' },
@@ -124,6 +149,9 @@ export const SETTING_TO_CONFIG = {
   comfy_hires_artist:             { obj: 'comfyui',  key: 'hiresArtist',      type: 'string' },
   feature_imageGenMode:            { obj: 'features', key: 'imageGenMode',     type: 'string' },
   town_generation_settings:       { obj: 'town',     key: 'generation',       type: 'json'  },
+  // 反重复采样参数：'' = 不发送该字段（与历史请求体一致）
+  anti_repetition_penalty:        { obj: 'llm',      key: 'antiRepetitionPenalty',   type: 'penalty' },
+  anti_repetition_frequency:      { obj: 'llm',      key: 'antiRepetitionFrequency', type: 'penalty' },
 };
 
 function castValue(raw, type) {
@@ -133,6 +161,12 @@ function castValue(raw, type) {
     case 'float': { const v = parseFloat(raw); return Number.isNaN(v) ? undefined : v; }
     case 'bool': return raw === 'true' || raw === '1';
     case 'json': { try { const v = JSON.parse(raw); return v; } catch { return undefined; } }
+    // penalty：空串 = 用户清空 → null（请求体里不发送）；非法数字 → undefined（保留代码默认）
+    case 'penalty': {
+      if (String(raw).trim() === '') return null;
+      const v = parseFloat(raw);
+      return Number.isFinite(v) ? Math.max(-2, Math.min(2, v)) : undefined;
+    }
     default:     return raw;
   }
 }

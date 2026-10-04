@@ -23,9 +23,11 @@ import {
 import { broadcast } from './unifiedStreamBus.js';
 import { getStandingDisplay } from './standingDisplay.js';
 import { getFreshUnsharedDream, markDreamShared } from './dreamService.js';
+// 用户信息块的唯一构造器：与"叫醒"链共用，避免两处各写一份再漂移（persona 曾被丢掉，见该函数注释）
+import { buildUserInfoBlock } from './wakeService.js';
 import { createCharacterTownLifeContext } from './characterTownLifeContext.js';
 import { createTownActorRegistry } from './town/townActorRegistry.js';
-import { maybeGenerateDailyNewspaper } from './newspaperService.js';
+import { runProgramDayRollover } from './programDayRollover.js';
 
 const CHECK_INTERVAL = 1 * 60 * 1000; // 1 分钟
 
@@ -62,9 +64,13 @@ async function tick() {
   processing = true;
 
   try {
-    // 0. 每日预告报纸《邻舍日报》：每天零点起补当天份（内部自带去重/节流/错误兜底，
-    //    fire-and-forget——生成含 LLM 与逐张配图，不能阻塞下面的调度）
-    maybeGenerateDailyNewspaper();
+    // 0. 世界翻篇检查（2026-10-01）：程序日期变了就跑一遍日常任务（日报 / 记忆整理…）。
+    //    这里覆盖"程序时间自然流过午夜"；手动调时走 timeControl 的立即触发。
+    //    同一天重复调用是空操作（处理过的日期落库），所以放在 tick 里没有额外开销。
+    //    fire-and-forget：内部任务含 LLM 与逐张配图，绝不能阻塞下面的调度。
+    runProgramDayRollover({ reason: 'tick' }).catch(err => {
+      console.warn('[rollover] tick 触发失败（已忽略）:', err?.message || err);
+    });
 
     // 1. 日程分散刷新（每次 tick 最多 1 个角色）
     await maybeRefreshOneSchedule();
@@ -309,14 +315,12 @@ function buildDelayedReplyContext(entry, allPending, isSleepWakeup, dream = null
     relParts.push(`<oath_bond>你们之间有一个比普通关系更深一层的约定——${chatUserName}曾经郑重地送过你一枚戒指。这代表了独一无二的羁绊和承诺。在对话中，你的行为和情感会自然地带有"你是我最重要的人"的底色——不是因为规则要求，而是因为这层羁绊已经是你内心的一部分。</oath_bond>`);
   }
 
-  // 用户信息
-  if (config.user.nickname || config.user.gender || config.user.appearance) {
-    const infoParts = [];
-    infoParts.push(`消息中标记为"user"的人是"${chatUserName}"`);
-    if (config.user.gender) infoParts.push(`性别：${config.user.gender}`);
-    if (config.user.appearance) infoParts.push(`外观特征：${config.user.appearance}`);
-    relParts.push(`<user_info>${infoParts.join('。')}</user_info>`);
-  }
+  // 用户信息（昵称/性别/外观/自我描述 + 遵从约束）
+  // 2026-10-02 用户反馈「角色对话还是有一些不遵从设定，和玩家的性别与自我描述」：这里原先只推
+  // nickname / gender / appearance，**persona（玩家的自我描述）被整条丢掉**，与私聊主链口径不一致。
+  // 现在与叫醒链共用同一个构造器 `buildUserInfoBlock`（persona 曾被丢掉的来龙去脉写在那里）。
+  const userInfoBlock = buildUserInfoBlock(chatUserName);
+  if (userInfoBlock) relParts.push(userInfoBlock);
   if (relParts.length > 0) {
     msgs.push({ role: 'system', content: relParts.join('\n') });
   }

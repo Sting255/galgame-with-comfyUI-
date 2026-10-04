@@ -28,8 +28,21 @@
 - `/test/fixtures/townSpriteColor.html`：角色肤色、昼夜、画质档位与色彩输出，页面显示 PASS / FAIL。
 - `/test/fixtures/townObjectColor.html`：建筑、道具、灯具的材质与色彩输出，页面显示 PASS / FAIL。
 - `/test/fixtures/whiteGaps.html`：图像编辑器的留白预览、恢复与保存失败交互，使用合成图片和模拟保存接口。
+- `/test/fixtures/intimatePanel.html`：亲密看板（双主题 / 兼容 360px 窄屏 / 组件级漂移自检）。页面直接挂载真实 `IntimatePanel.vue`，用 `fetch` 打桩后端接口（离线可跑，不连本地服务），加 `?theme=dark` 可以暗夜主题打开。
+- `/test/fixtures/intimatePanelLive.html`：亲密看板 live 端到端（真实组件 + 真实后端数据，需先起 agent-core 与 vite；与上面的 stub 版互补，不做 fetch 打桩）。
+
+两者分工：`intimatePanel.html` 离线可跑，覆盖组件结构漂移与暖色 / 暗夜双主题、360px 窄屏；`intimatePanelLive.html` 依赖真实服务，验证真实数据读数与真实写路径。
+- `/test/fixtures/standingInteraction.html`：真实立绘展示组件、合成 SVG 和内存接口。可检查默认全身 11 类空手触摸、缓存台词、主题、睡眠、聊天抢占、延迟配置、换角色与图片更新；顶部计数可核查手势不产生请求和写入，未列入的 API 一律拦截。样例不读写真实角色数据。
+
+立绘样例的「运行手势回归」通过合成 PointerEvent 验证生产组件的 11 类部位命中、对应缓存台词、取消/第二触点/失焦/resize。仅在测试 SVG 上模拟浏览器不允许合成指针申请的 Pointer Capture 三个方法，不替换生产命中、规则或状态代码。真实鼠标点击须另行实测；合成输入的通过不能声称已完成真实手机多点触摸验收。
+
+`/test/fixtures/standingInteractionFrame.html` 将同一回归舞台放进带位移、缩放和旋转的 iframe，用于复核小窗嵌入坐标。它并不模拟 Document PiP 的系统置顶能力。
 
 浏览器样例及其 HTML / SVG 配套资源共同保留；算法单测不能替代 GPU 和画布交互检查。修改相关渲染或编辑功能后应额外运行这些样例。
+
+写这类"读计算样式"或"驱动真实页面"的自检时注意三点：① 切换主题后立刻读 `getComputedStyle` 会拿到过渡起点而不是最终色（面板、开关、`body` 都带 0.3s 过渡），必须先冻结 `transition` 并 `cancel()` 掉已在跑的动画再断言；② `Page.navigate` 到同一个 hash URL 不等于重载（同文档导航），验证"页面是否跟随后端"必须用 `Page.reload{ignoreCache:true}`，否则会得到假阴性；③ 新库首次打开设置页会弹出「更新说明」模态遮罩、吃掉 CDP 鼠标点击的坐标，自动化点击前先发 Escape 关掉它。用 CDP 驱动时若后端端口被队友占用，另开端口 + 在 `%TEMP%` 放一份 import 真实 `vite.config.js` 并只覆盖 proxy target 的临时配置，比改仓库文件再还原更稳。
+
+驱动环境本身还有三条坑：① 无 BOM 的 `.ps1` 会被本机 PowerShell 按 ANSI 解码，中文注释会吃掉引号导致解析失败（临时驱动脚本请写 UTF-8 BOM）；② PS7 的 `Invoke-RestMethod` 对 JSON 数组不做枚举，拉 `/json/list` 多 target 时会把整个数组当成一个 target（需 `@()` 包一层）；③ 样例 Chrome 异常退出会残留并占住调试端口，下次拿到的是旧实例的 target 列表（起之前先按命令行特征清掉自己的 Chrome）。
 
 ## 清理记录与后续准则
 
@@ -41,3 +54,5 @@
 - 同一功能的小用例优先合并到已有测试中；不要复制生产逻辑再验证复制品。
 - 删除功能或测试时同步检查其 fixture、worker、预览资源和文档入口是否仍有调用方。
 - 临时验证脚本和日志用完即删；需反复使用的回归逻辑按 `AGENTS.md` 约定纳入正式测试。
+
+触摸样例还验证按下形变、松手回弹、最终恢复原形，以及图片节点不被重建。「完整触摸动效预览」只在测试页覆盖媒体偏好输入，以检查完整动画分支，不修改用户系统设置。

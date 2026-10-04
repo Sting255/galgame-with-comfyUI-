@@ -1,4 +1,5 @@
-/**
+
+import { buildImagePromptRuleBlock } from '../builtinRules.js';/**
  * 朋友圈关系网互动服务
  *
  * 帖子发布后，关系网中的角色有概率来评论区互动：
@@ -117,6 +118,9 @@ ${MOMENT_COMMENT_RULES}
 - 看你的性格和你们的关系，决定是调侃、关心、吐槽，还是只起个哄`;
 
   const msgs = [{ role: 'system', content: permissionPrompt }];
+  // Authoritative image rules: the author requires this block in EVERY image path.
+  // This path lets the model write the picture description itself.
+  msgs.push({ role: 'system', content: buildImagePromptRuleBlock() });
   if (worldIntegrationNote) msgs.push({ role: 'system', content: worldIntegrationNote });
   msgs.push({ role: 'system', content: friend.other_prompt });
   if (otherContext) msgs.push({ role: 'system', content: otherContext });
@@ -170,6 +174,9 @@ ${MOMENT_COMMENT_RULES}
 - 可以参考上下文，但不要重复自己说过的话`;
 
   const msgs = [{ role: 'system', content: permissionPrompt }];
+  // Authoritative image rules: the author requires this block in EVERY image path.
+  // This path lets the model write the picture description itself.
+  msgs.push({ role: 'system', content: buildImagePromptRuleBlock() });
   if (worldIntegrationNote) msgs.push({ role: 'system', content: worldIntegrationNote });
   msgs.push({ role: 'system', content: posterChar.base_prompt });
   if (otherContext) msgs.push({ role: 'system', content: otherContext });
@@ -225,6 +232,9 @@ ${MOMENT_COMMENT_RULES}
 - 可以顺着话题聊下去，也可以自然转移`;
 
   const msgs = [{ role: 'system', content: permissionPrompt }];
+  // Authoritative image rules: the author requires this block in EVERY image path.
+  // This path lets the model write the picture description itself.
+  msgs.push({ role: 'system', content: buildImagePromptRuleBlock() });
   if (worldIntegrationNote) msgs.push({ role: 'system', content: worldIntegrationNote });
   msgs.push({ role: 'system', content: friend.other_prompt });
   if (otherContext) msgs.push({ role: 'system', content: otherContext });

@@ -149,11 +149,25 @@ test('提到用户时的注入块与角色块同形：`[名字]` + 换行 + 资�
   }
 });
 
-test('无生效外观时 short variant 与旧口径逐字节一致（short_prompt + 外观段）', () => {
-  assert.equal(
-    buildCharacterPersona(CHAR, { outfits: null }),
-    '小满是面包店店员。\n## 你的外观\n小满有着栗色长发与琥珀色眼睛。',
-  );
+test('无生效外观时 short variant 走"运行时现裁"，不再采用库里那份 short_prompt', () => {
+  // ⚠️ 2026-10-02（技术债②）：原来这里断言 short variant == `short_prompt + 外观段`（逐字节一致）。
+  //    那个口径的后果是：库里 8 个角色存的都是**旧裁剪口径**（LLM 浓缩 ~200 字、甚至切在半句上）的产物，
+  //    于是群聊成员资料卡 / 梦境 / 多角色参考全都吃不到 `cropPersonalityForEmotion` 的修复
+  //    （真实数据：德丽莎整卡 2212 字 ⇒ 实际只用 200 字 = 9%），表现就是用户说的「角色不遵从设定」。
+  //    现在改成运行时从 `base_prompt` 现裁 —— 所以这条断言钉的**行为**也换了：
+  //    ① 人格部分来自整卡现裁（含身份/性格，不再是那一句 200 字浓缩）；
+  //    ② 绝**不**等于库里那份旧 short_prompt（这就是防止有人又改回读库的反向守卫）；
+  //    ③ 外观段照旧接在后面（外观归生图链管，与本债无关）。
+  const out = buildCharacterPersona(CHAR, { outfits: null });
+  assert.ok(out.includes('## 你的外观'), '外观段照旧要接在后面');
+  assert.ok(out.includes('栗色长发与琥珀色眼睛'), '外观内容不能被裁掉');
+  assert.notEqual(out, '小满是面包店店员。\n## 你的外观\n小满有着栗色长发与琥珀色眼睛。',
+    '不许再逐字节等于"库里 short_prompt + 外观段"——那正是本债要废掉的口径');
+  const personaPart = out.split('## 你的外观')[0];
+  assert.ok(!personaPart.includes('小满是面包店店员。'),
+    '人格部分不该是库里那份浓缩 short_prompt（它吃不到裁剪修复）');
+  assert.match(personaPart, /小满/, '现裁结果仍要带角色名（"你"已替换）');
+  assert.ok(!personaPart.includes('你是小满'), '开场白「你是X」应替换为「X」，不该留下第一人称');
 });
 
 test('无生效外观时 full variant 与旧口径逐字节一致（整卡原样）', () => {
@@ -168,10 +182,17 @@ test('无生效外观时 buildImageCrossRefInfo 与旧口径逐字节一致（�
   );
 });
 
-test('无外观段的角色：short 兜底整卡、full 原样返回', () => {
+test('没有 short_prompt 的行（小镇 NPC 等）：short 兜底整卡、full 原样返回（旧口径刻意保留）', () => {
+  // ⚠️ 2026-10-02 技术债②收口时特意**保留**了这条：现裁只顶替"原来那份 short_prompt 的位置"。
+  //    这行没有 short_prompt ⇒ 人格留空（有外观段时只用外观段，见 townAssetRequest.test.js 的断言：
+  //    "人格卡正文不该混进外观需求"），没有外观段时才兜底整卡。
   const plain = { id: 2, display_name: '阿岚', short_prompt: '', base_prompt: '你是阿岚，来自邻舍镇的邮差。' };
   assert.equal(buildCharacterPersona(plain, { outfits: null }), '你是阿岚，来自邻舍镇的邮差。');
   assert.equal(buildCharacterPersona(plain, { variant: 'full', outfits: null }), '你是阿岚，来自邻舍镇的邮差。');
+
+  // 有 short_prompt（真角色卡）时才是现裁路径；base_prompt 为空则退回库里那份
+  const noBase = { id: 3, display_name: '阿岚', short_prompt: '阿岚是邮差。', base_prompt: '' };
+  assert.equal(buildCharacterPersona(noBase, { outfits: null }), '阿岚是邮差。');
 });
 
 // 外观段编辑与身份提取：与人格组装共同维护，避免同名测试分散。

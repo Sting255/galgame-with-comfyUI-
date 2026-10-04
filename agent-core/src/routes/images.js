@@ -148,10 +148,24 @@ router.post('/generate', async (req, res) => {
   generateImage(prompt, { promptScene: 'standalone', ragQuery: rag_query, ragTimeoutMs: RAG_TIMEOUT_FAST_MS })
     .then(result => {
       if (result.success) {
+        // 2026-10-01 修（真实流程实测发现）：原来存的是 `i.filename`（**裸文件名**），既没落进
+        // data/images，调用方按 `/images/<名>` 取也必然 404 —— 实测那张图当时躺在
+        // `C:\ComfyUI\ComfyUI\temp\` 里，而 ComfyUI 会清理那个目录。
+        // 现在与聊天 / 朋友圈 / 奇遇同口径：saveBase64Image 落盘 → 存返回的 `/images/...` URL。
+        const urls = [];
+        for (const img of result.images) {
+          if (!img?.base64) continue;
+          const filename = `standalone_${Date.now()}_${img.filename || 'comfy.png'}`;
+          try {
+            urls.push(saveBase64Image('standalone', filename, img.base64));
+          } catch (err) {
+            console.warn('[images] standalone 落盘失败:', err.message);
+          }
+        }
         db.prepare(`
           UPDATE image_tasks SET status = 'done', prompt_refined = ?, output_paths = ?, workflow_template = ?, finished_at = datetime('now')
           WHERE id = ?
-        `).run(result.promptRefined || prompt, JSON.stringify(result.images.map(i => i.filename)), result.wfMode, taskId);
+        `).run(result.promptRefined || prompt, JSON.stringify(urls), result.wfMode, taskId);
       } else {
         db.prepare(`
           UPDATE image_tasks SET status = 'failed', error_message = ?, workflow_template = ?, finished_at = datetime('now')

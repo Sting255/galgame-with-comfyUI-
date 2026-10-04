@@ -213,6 +213,11 @@
     <!-- 礼物叙事：把小镇货摊买来的道具送给角色，图片 + 描述沿用小镇服务/打工的胶片样式 -->
     <TownServiceStage :open="giftStage.open" :session="giftStage.session" @close="giftStage.open = false" />
 
+    <!-- ── 催眠手机面板：背包里「使用」手机时改开这里，而不是走通用道具流程 ── -->
+    <linshe-modal v-model="hypnosisPhone.open" title="催眠手机">
+      <HypnosisPhonePanel v-if="hypnosisPhone.character" :character="hypnosisPhone.character" />
+    </linshe-modal>
+
     <ChestRevealOverlay
       :show="fullscreen"
       :chest-anim="chestAnim"
@@ -233,6 +238,8 @@ import ChestSvg from '../components/ChestSvg.vue'
 import ItemFallbackIcon from '../components/ItemFallbackIcon.vue'
 import ChestRevealOverlay from '../components/ChestRevealOverlay.vue'
 import TownServiceStage from '../components/town/TownServiceStage.vue'
+import LinsheModal from '../components/ui/LinsheModal.vue'
+import HypnosisPhonePanel from '../components/HypnosisPhonePanel.vue'
 import { useBackpackActions, ITEM_KIND_LABELS as KIND_LABELS } from '../composables/useBackpackActions.js'
 import { useChatStore } from '../stores/chat.js'
 
@@ -253,6 +260,7 @@ const {
   removingEffectId, onRemoveEffect,
   detailItem, openDetail, startUse, giftStage,
   showCharPicker, pendingItem, cancelPick, pickCharacter,
+  hypnosisPhone,
   onDiscard,
 } = useBackpackActions({ confirm, toast })
 

@@ -15,7 +15,12 @@ function build({ globals = [], chars = [], hires = [], legacy = false, scale = 1
   workflowMode = 'advanced', upscaleModel = '', samplingMode = 'source', sourceSamplers = [[0, 'fixed', 12, 1, 'euler', 'simple', 1]] } = {}) {
   Object.assign(config.comfyui, { globalLora: globals, hiresLora: hires, hiresSteps: 35,
     hiresCfg: 5, hiresDenoise: 0.3, hiresMaxSize: 2000, hiresArtistMode: 'empty',
-    hiresGlobalLoraScale: scale, hiresSourceBlend: blend, hiresSamplingMode: samplingMode, hiresUpscaleModel: upscaleModel, hiresWorkflowMode: workflowMode });
+    hiresGlobalLoraScale: scale, hiresSourceBlend: blend, hiresSamplingMode: samplingMode, hiresUpscaleModel: upscaleModel, hiresWorkflowMode: workflowMode,
+    // 本文件测的是**细化工作流引擎本身**（显式参数 / 跟随原图 / 参数继承），所以一律关掉本仓自研的
+    // `hiresTurbo`（默认 true）。它按 UI 承诺会在打开时强制覆盖「设置里的步数与 CFG」
+    // （low 档 8 步 / CFG 1.0），那是另一条链路，由 test/hiresTurboMode.test.js 与
+    // test/hiresQuality.test.js 单独覆盖 —— 这里不关掉的话，本文件所有采样断言都会被它顶掉。
+    hiresTurbo: false });
   const read = fs.readFileSync;
   mock.method(fs, 'readFileSync', (file, ...args) => {
     if (/放大细化工作流(?:-进阶)?\.json$/.test(String(file))) {

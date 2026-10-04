@@ -4,6 +4,9 @@
  * 新格式为 {description}，旧 JSON 格式仅用于历史兼容。该模块同时供群聊
  * transcript 构建和摘要/后处理使用，避免 prompt 规则更新后各端失同步。
  */
+// 规范回显剥离要用规范原文做逐句比对；builtinRules.js 是纯常量模块（无 import），不会成环。
+import { IMAGE_PROMPT_RULE } from '../builtinRules.js';
+
 export const LEGACY_IMG_LINE_RE = /\{["'“”]?prompt["'“”]?\s*:\s*["“]((?:[^"”\\]|\\.)*)["”]\s*\}/i;
 export const DIRECT_IMG_LINE_RE = /^\{([\s\S]+)\}$/;
 
@@ -120,6 +123,143 @@ export function stripImagePromptLines(content) {
 /** 移除消息中嵌入的旧版 {"prompt":"..."} JSON 块，保留同一行里的对话文本。 */
 export function stripLegacyPromptJson(content) {
   return String(content || '').replace(new RegExp(LEGACY_IMG_LINE_RE.source, 'gi'), '');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 「规范回显」剥离 —— 送进 CLIP 之前把写作规范原文从画面描述里摘掉
+//
+// 真机现场（logs/backend-2026-10-01.log:201/223，2026-10-01）：
+//   奇遇生成返回的 JSON 里 `"prompt"` 是「规范原文 + 它自己写的场景」的拼接：
+//   "Describe the image as a flowing, detailed scene in natural English — one continuous
+//    paragraph.\n\nFollow this progression:\n\n1. Scene Setting — Open with the overall
+//    environment, framing, and mood. This is a nursing training room…"
+//   代码原样把它送进 ComfyUI ⇒ CLIP 的**起始 token 全是写作说明**而不是画面，
+//   出图和文字描述完全对不上（用户报的「图和文字描述完全都不一样」）。
+//   根因是调用方把规范正文当成了 JSON 示例值（已同步修 eventGenerator.js），
+//   这里是不依赖任何调用方的**兜底**：宁可少几个词，也不能让「Describe the image…」进 CLIP。
+//
+// 为什么按句删而不是按前缀截断：模型会把场景**穿插**在规范的标题之间
+// （"1. Scene Setting — <规范句> This is a nursing training room…"），
+// 前缀截断会把真正的画面一起切掉。回显是**逐字照抄**，所以逐句比对规范原文最稳。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** 规范里的章节标题（可能带编号、加粗、破折号或冒号） */
+const SECTION_LABELS = [
+  'scene setting', 'environment & props', 'lighting', 'atmosphere',
+  'scene-appropriate clothing', 'two people share the frame', 'hard rules',
+  'follow this progression',
+];
+const SECTION_LABEL_ALT = SECTION_LABELS.map(l => l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+/** 段首的「1. 」「- 」「**Scene Setting — **」这类只起排版作用的残渣 */
+const LEADING_AFFIX_RE = new RegExp(
+  // 顺序有讲究：**加粗小标题** 必须排在「项目符号」前面，
+  // 否则 `[-•*]+` 会先把 `**MUST:**` 的头两个星号吃掉，剩下 `MUST:** When…` 判不出是回显。
+  '^(?:'
+  + '\\s*\\*\\*[^*]*\\*\\*\\s*[—–:-]?\\s*'          // **MUST:** / **Scene Setting —**
+  + '|\\s*\\d+\\s*[.、]\\s*'                       // 1. / 2、
+  + '|\\s*[-•]+\\s*'                              // - / •
+  + '|\\s*(?:' + SECTION_LABEL_ALT + ')\\s*[—–:-]\\s*'
+  + ')+',
+  'i',
+);
+
+/** 只用于**比对**的归一化：去排版残渣、去加粗、合并空白、去句末标点、转小写 */
+function normalizeForCompare(text) {
+  return String(text ?? '')
+    .replace(LEADING_AFFIX_RE, '')
+    .replace(/\*\*/g, '')
+    // 标点变体统一：模型回显时经常把破折号抄成普通连字符、把弯引号抄成直引号
+    // （规范原文用的是 `—` 和 `'`）。不归一化就会「差一个字符 ⇒ 整句认不出来被留下」。
+    .replace(/[—–−]/g, '-')
+    .replace(/[“”„‟]/g, '"')
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[.!?。！？；;：:]+$/, '')
+    .trim()
+    .toLowerCase();
+}
+
+/** 把规范原文拆成「句子」集合（与正文同样的拆句口径），用于逐句比对 */
+function boilerplateSentenceSet(ruleText) {
+  const set = new Set();
+  for (const line of String(ruleText ?? '').split(/\n+/)) {
+    for (const seg of line.split(/(?<=[.!?])\s+/)) {
+      const norm = normalizeForCompare(seg);
+      if (norm.length >= 8) set.add(norm);
+    }
+  }
+  for (const label of SECTION_LABELS) set.add(label);
+  return set;
+}
+
+/**
+ * 规范原文的「句子拼接串」，用 ` || ` 当分隔（归一化后的句子里不可能出现它）。
+ * 回显是逐字照抄 ⇒ 真正的规范片段一定是**某一句规范原文的子串**；
+ * 用子串而不是全等，是为了兜住模型抄的时候掉了个把词 / 把加粗符号抄歪的情况。
+ */
+function boilderplateBlob(ruleText) {
+  const parts = [];
+  for (const line of String(ruleText ?? '').split(/\n+/)) {
+    for (const seg of line.split(/(?<=[.!?])\s+/)) {
+      const norm = normalizeForCompare(seg);
+      if (norm) parts.push(norm);
+    }
+  }
+  return ' || ' + parts.join(' || ') + ' || ';
+}
+
+/** 这段（归一化后）是不是规范原文的回显 */
+function isBoilerplateFragment(norm, boilerplate, blob) {
+  if (!norm) return true;
+  if (boilerplate.has(norm)) return true;
+  // 阈值取 3：短到 3 个字符还能命中规范原文的，只可能是 "e.g" 这类排版残渣；
+  // 真正的画面描述不会整个句子都是规范里的某个词组。
+  return norm.length >= 3 && blob.includes(norm);
+}
+
+/**
+ * 剥离画面描述里被模型回显的生图规范原文。
+ *
+ * @param {string} prompt            送进 ComfyUI 的画面描述（可能是「规范 + 场景」的拼接）
+ * @param {object} [opts]
+ * @param {string} [opts.ruleText]   规范原文；缺省用内置 `image_prompt` 规则
+ * @returns {{ prompt: string, changed: boolean, droppedChars: number, isEmpty: boolean }}
+ *          `isEmpty=true` 表示剥完什么都不剩（整条都是规范），调用方应放弃本次生图
+ */
+export function stripImagePromptRuleEcho(prompt, { ruleText } = {}) {
+  const original = String(prompt ?? '').trim();
+  if (!original) return { prompt: '', changed: false, droppedChars: 0, isEmpty: true };
+
+  const lowered = original.toLowerCase();
+  // 快路径：没有规范特征词就直接放行（绝大多数生图调用都走这里，零额外开销）
+  if (!IMAGE_RULE_ECHO_MARKERS.some(marker => lowered.includes(marker))) {
+    return { prompt: original, changed: false, droppedChars: 0, isEmpty: false };
+  }
+
+  const ruleSource = ruleText ?? IMAGE_PROMPT_RULE.rule_content;
+  const boilerplate = boilerplateSentenceSet(ruleSource);
+  const blob = boilderplateBlob(ruleSource);
+  const kept = [];
+  for (const rawSeg of original.split(/(?<=[.!?])\s+/)) {
+    const norm = normalizeForCompare(rawSeg);
+    if (isBoilerplateFragment(norm, boilerplate, blob)) continue;   // 规范回显 → 丢
+    kept.push(rawSeg.replace(LEADING_AFFIX_RE, '').trim());
+  }
+  const cleaned = kept
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/^[\s.,;:—–-]+/, '')
+    .trim();
+  const droppedChars = original.length - cleaned.length;
+  // 「没有可用场景」的判据（两道，取或）：
+  //   · 剥完什么都不剩；或
+  //   · **剥掉的占了大头（≥2/3）** —— 说明这条本来就是规范原文，留下的只是零碎标题/示例句，
+  //     送进 CLIP 同样只会得到与剧情无关的图。
+  //   真机那条（规范 + 完整场景）只掉 13%，离阈值很远，不会被误判。
+  const isEmpty = cleaned.length === 0 || droppedChars >= original.length * (2 / 3);
+  return { prompt: cleaned, changed: cleaned !== original, droppedChars, isEmpty };
 }
 
 // 成对花括号块：群聊协议把花括号保留给生图，私聊旧格式为 {"prompt":"..."}。

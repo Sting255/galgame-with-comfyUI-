@@ -1,0 +1,13 @@
+{
+  "name": "linshe-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "浏览器 E2E（Playwright）——真实流程端到端验收。跑法见 README.md / e2e/run-e2e.mjs 文件头。",
+  "scripts": {
+    "test:e2e": "node run-e2e.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.60.0"
+  }
+}

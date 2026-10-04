@@ -25,6 +25,8 @@ import {
   syncSleepingState, isTempWoken, isSleeping,
   scheduleTempWakeExpiry, resetGroggyShown,
 } from '../services/scheduleManager.js';
+import { getProgramDateKey, getProgramState, formatHhmm } from '../services/programTime.js';
+import timeRoutes from './time.js';
 import { generateSchedule, assignNextRefreshTime, snapshotTodaySchedule } from '../services/scheduleGenerator.js';
 import { updateScheduleActivity } from '../services/scheduleEditor.js';
 import { generateImage, getLastWorkflowMode } from '../services/imageSkill.js';
@@ -35,10 +37,49 @@ import { chatSync } from '../llm/llm-client.js';
 import { getTimeLightInline } from '../services/timeLight.js';
 import { saveBase64Image } from '../services/imagePaths.js';
 import { processWakeUp } from '../services/wakeService.js';
-import { getLocalDateKey } from '../utils/localDate.js';
 import { createTownActorRegistry } from '../services/town/townActorRegistry.js';
+// 2026-10-02 私密时刻（自慰 / 你闯进来了）：判定与文案的唯一来源，日程页只做投影
+import { privateMomentState, privateMomentLine, PRIVATE_MOMENT_LABEL } from '../services/privateMomentService.js';
+import { loadAffinity } from '../services/emotionEngine.js';
 
 const router = Router();
+
+/**
+ * 私密时刻（自慰）的投影 —— 日程页与面板共用的一份形状（**别在两处各拼一遍**）。
+ *
+ * 用户原话：「再增加一个事件 叫自慰 和角色敏感度也相关 越高发生概率也就越高 这个可以算到日程里」。
+ * 判定本身是确定性的（角色 + 日期 + 槽位哈希）⇒ 读多次结论一致；这里只做投影，不写库。
+ * 没有独处时段 / 没掷中 ⇒ `{ has: false }`（前端零渲染）。
+ */
+function privateMomentPayload(characterId) {
+  const empty = { has: false, active: false, caught: false, caughtTimes: 0, label: PRIVATE_MOMENT_LABEL, line: '', startTime: '', endTime: '', minutesLeft: 0 };
+  try {
+    let affinity = 0;
+    try { affinity = Number(loadAffinity(characterId)) || 0; } catch { affinity = 0; }
+    const st = privateMomentState(characterId, { affinity });
+    if (!st.row || !st.window) return { ...empty, probability: st.probability || 0 };
+    return {
+      has: true,
+      active: st.active,
+      caught: st.caught,
+      caughtTimes: Number(st.row.caught_times) || 0,
+      label: st.label,
+      line: privateMomentLine(st),
+      startTime: formatHhmm(Number(st.window.startMinute) % 1440),
+      endTime: formatHhmm(Number(st.window.endMinute) % 1440),
+      minutesLeft: st.minutesLeft,
+      probability: st.probability || 0,
+    };
+  } catch (err) {
+    console.warn('[schedule] private moment 投影失败（按没有处理）:', err?.message || err);
+    return empty;
+  }
+}
+
+// ── 程序时间（世界钟）子路由：/api/schedule/time* ──
+// 见 src/routes/time.js 的文件头（形状、错误码、以及"为什么没有挂在 /api/time"）。
+// 放在 `/`（概览）之前不影响既有路径：`/time` 是唯一前缀，不会吃掉 `/:characterId`。
+router.use('/time', timeRoutes);
 
 // ── GET /api/schedule — 所有角色概览 ──
 
@@ -49,7 +90,8 @@ router.get('/', (req, res) => {
     }
 
     const overview = getAllOverview();
-    res.json({ characters: overview });
+    // 附加当前程序时间（前端日程页与时间控制面板都用它；老前端忽略即可）
+    res.json({ characters: overview, program_time: getProgramState() });
   } catch (err) {
     console.error('[schedule] GET / error:', err.message);
     res.status(500).json({ error: err.message });
@@ -213,13 +255,33 @@ router.get('/:characterId', (req, res) => {
       character_id: character.id,
       display_name: character.display_name,
       avatar_path: character.avatar_path,
-      schedule_date: getLocalDateKey(),
+      schedule_date: getProgramDateKey(),
       activities: schedule || [],
+      // 2026-10-02 私密时刻「自慰 / 你闯进来了」（用户：「这个可以算到日程里」）：
+      // 她今天有没有一段"一个人在屋里"的时间、此刻是不是正在进行 —— 判定确定性，读一次结论稳定。
+      // 没掷中 / 没有独处时段 ⇒ null（前端零渲染），不干扰原有日程展示。
+      private_moment: privateMomentPayload(characterId),
       template_version: template?.version || 0,
       template_generated_at: template?.generated_at || null,
     });
   } catch (err) {
     console.error('[schedule] GET /:id error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/schedule/:characterId/private-moment — 她今天的私密时刻（自慰）──────
+// 单独给一条端点：面板/日程页要轮询"她此刻在不在屋里"，不必每次都拉整份日程。
+// 返回形状：{ characterId, has, active, caught, caughtTimes, label, line, startTime, endTime, minutesLeft }
+router.get('/:characterId/private-moment', (req, res) => {
+  try {
+    const characterId = parseInt(req.params.characterId, 10);
+    if (isNaN(characterId)) return res.status(400).json({ error: 'invalid characterId' });
+    const character = getDb().prepare('SELECT id FROM characters WHERE id = ?').get(characterId);
+    if (!character) return res.status(404).json({ error: 'character not found' });
+    res.json({ characterId, ...privateMomentPayload(characterId) });
+  } catch (err) {
+    console.error('[schedule] GET /:id/private-moment error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

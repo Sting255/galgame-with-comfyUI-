@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { load as yamlLoad } from 'js-yaml';
-import { config, updateComfyConfig, getNovelaiApiKey, updateFeatureFlag, getLlmConfig, getLlmApiKey, updateLlmConfig, updateFreeEggEnabled, updateUserConfig, getUserConfig, updateProactiveFreq, updateEventFreq, updateBackgroundConcurrency, updateDisturbMode, updateDisturbSettings, updateWorkflowMode, updateWorkflowScene, getWorkflowConfig, getLlmProfiles, getActiveProfileId, addLlmProfile, deleteLlmProfile, activateLlmProfile, syncActiveLlmProfile, updateWeatherConfig, updateGlobalLora, updateHiresSettings, updateHiresLora, updateGroupSummaryInterval, updateGroupTemperature, updateGroupActivity, updateScheduleRefreshDays } from '../config.js';
+import { config, updateComfyConfig, getNovelaiApiKey, updateFeatureFlag, getLlmConfig, getLlmApiKey, updateLlmConfig, updateFreeEggEnabled, updateUserConfig, getUserConfig, updateProactiveFreq, updateEventFreq, updateBackgroundConcurrency, updateDisturbMode, updateDisturbSettings, updateWorkflowMode, updateWorkflowScene, getWorkflowConfig, getLlmProfiles, getActiveProfileId, addLlmProfile, deleteLlmProfile, activateLlmProfile, syncActiveLlmProfile, updateWeatherConfig, updateGlobalLora, updateHiresSettings, updateHiresLora, updateGroupSummaryInterval, updateGroupTemperature, updateGroupActivity, updateScheduleRefreshDays, updateAntiRepetitionPenalty } from '../config.js';
 import { resetClient, chatSync, resetFreeEggFailureCount, testLlmConnection } from '../llm/llm-client.js';
 import { getDb, getSystemRules } from '../db/index.js';
 import { listWorldSettings, getActiveWorldSetting, getWorldSettingById, createWorldSetting, updateWorldSetting, deleteWorldSetting, activateWorldSetting } from '../db/index.js';
@@ -18,6 +18,11 @@ import { BUILTIN_RULE_KEYS } from '../builtinRules.js';
 import { getMemorySettings, saveMemorySettings, normalizeMemorySettings } from '../services/memory/memoryConfig.js';
 import { getPreferredMemoryEmbeddingProfile, testEmbeddingProvider, testRerankerProvider } from '../services/memory/memoryProviders.js';
 import { reindexAllMemories } from '../services/memory/memoryRepository.js';
+import { resolveDeclaredOrProviderWindow } from '../services/contextUsage.js';
+import {
+  getAiJudgeQuotaPayload,
+  setAiJudgeDailyLimit,
+} from '../services/intimateAiJudge.js';
 
 const router = Router();
 
@@ -113,6 +118,8 @@ router.get('/', (req, res) => {
       hiresSteps: config.comfyui.hiresSteps ?? 35,
       hiresCfg: config.comfyui.hiresCfg ?? 5.0,
       hiresDenoise: config.comfyui.hiresDenoise ?? 0.2,
+      // 细化是否按 turbo 参数走（默认 true）；「随时开关」，无需重启
+      hiresTurbo: config.comfyui.hiresTurbo !== false,
       hiresMaxSize: config.comfyui.hiresMaxSize ?? 2000,
       hiresArtistMode: config.comfyui.hiresArtistMode ?? 'empty',
       hiresArtist: config.comfyui.hiresArtist ?? '',
@@ -135,6 +142,33 @@ router.get('/', (req, res) => {
       temperature: config.groupChat?.temperature ?? 0.7,
       summaryInterval: config.groupChat?.summaryInterval ?? 4,
     },
+    // 「AI 判断行为」的每日配额（usedToday 按本地日期，跨天自动归零；unlimited=true 时 remaining 为 null）
+    aiJudge: getAiJudgeQuotaPayload(),
+  });
+});
+
+// PUT /api/config/ai-judge — 「AI 判断行为」每日配额：0 = 不限制，正整数 = 次/天；非法 400
+//
+// 返回与 GET /api/config 里的 aiJudge 同一形状（{ dailyLimit, usedToday, remaining, unlimited }）：
+// 既嵌在 aiJudge 下（与 GET 一致），也平铺一份，前端两种取法都能用。
+router.put('/ai-judge', (req, res) => {
+  const { dailyLimit } = req.body ?? {};
+  // 只认整数：负数 / 小数 / 字符串 / 布尔 / 缺失都算非法（0 是合法值，代表不限制）
+  if (!Number.isInteger(dailyLimit) || dailyLimit < 0) {
+    return res.status(400).json({ error: 'dailyLimit must be 0 (不限制) or a positive integer (次/天)' });
+  }
+  const saved = setAiJudgeDailyLimit(dailyLimit);
+  if (!saved.ok) {
+    return res.status(500).json({ ok: false, error: saved.error });
+  }
+  const aiJudge = getAiJudgeQuotaPayload();
+  res.json({
+    ok: true,
+    aiJudge,
+    dailyLimit: aiJudge.dailyLimit,
+    usedToday: aiJudge.usedToday,
+    remaining: aiJudge.remaining,
+    unlimited: aiJudge.unlimited,
   });
 });
 
@@ -208,11 +242,11 @@ router.put('/hires-lora', (req, res) => {
 
 // PUT /api/config/hires — 更新 HiresFix 细化完整设置（LoRA + 步数/重绘幅度/CFG/最长边/画师串）
 router.put('/hires', (req, res) => {
-  const { loras, steps, cfg, denoise, maxSize, artistMode, artist, samplingMode, globalLoraScale, sourceBlend, upscaleModel, workflowMode } = req.body || {};
-  if (loras === undefined && steps === undefined && cfg === undefined && denoise === undefined && maxSize === undefined && artistMode === undefined && artist === undefined && samplingMode === undefined && globalLoraScale === undefined && sourceBlend === undefined && upscaleModel === undefined && workflowMode === undefined) {
+  const { loras, steps, cfg, denoise, maxSize, artistMode, artist, samplingMode, globalLoraScale, sourceBlend, upscaleModel, workflowMode, turboMode } = req.body || {};
+  if (loras === undefined && steps === undefined && cfg === undefined && denoise === undefined && maxSize === undefined && artistMode === undefined && artist === undefined && samplingMode === undefined && globalLoraScale === undefined && sourceBlend === undefined && upscaleModel === undefined && workflowMode === undefined && turboMode === undefined) {
     return res.status(400).json({ error: 'at least one hires setting is required' });
   }
-  updateHiresSettings({ loras, steps, cfg, denoise, maxSize, artistMode, artist, samplingMode, globalLoraScale, sourceBlend, upscaleModel, workflowMode });
+  updateHiresSettings({ loras, steps, cfg, denoise, maxSize, artistMode, artist, samplingMode, globalLoraScale, sourceBlend, upscaleModel, workflowMode, turboMode });
   res.json({
     ok: true,
     hiresLora: config.comfyui.hiresLora,
@@ -224,6 +258,7 @@ router.put('/hires', (req, res) => {
     hiresSteps: config.comfyui.hiresSteps,
     hiresCfg: config.comfyui.hiresCfg,
     hiresDenoise: config.comfyui.hiresDenoise,
+    hiresTurbo: config.comfyui.hiresTurbo !== false,
     hiresMaxSize: config.comfyui.hiresMaxSize,
     hiresArtistMode: config.comfyui.hiresArtistMode,
     hiresArtist: config.comfyui.hiresArtist,
@@ -245,6 +280,25 @@ router.put('/features', (req, res) => {
     restartWeatherScheduler();
   }
   res.json({ ok: true, features: config.features });
+});
+
+// PUT /api/config/anti-repetition — 反重复采样参数（presence_penalty / frequency_penalty）
+//
+// 默认两者都不发送（与加参数前的请求体逐字节一致）；设置页只在用户显式填了值时才透传。
+// 专题（阶段一）要求先拿真网关探针确认参数被接受再上 UI —— 未探明前这里保持"空=不发送"。
+router.put('/anti-repetition', (req, res) => {
+  const { presence, frequency } = req.body ?? {};
+  if (presence === undefined && frequency === undefined) {
+    return res.status(400).json({ error: 'presence or frequency is required' });
+  }
+  const saved = updateAntiRepetitionPenalty({ presence, frequency });
+  if (!saved.ok) return res.status(400).json({ error: saved.error });
+  res.json({
+    ok: true,
+    antiRepetitionPenalty: saved.presence ?? null,
+    antiRepetitionFrequency: saved.frequency ?? null,
+    llm: getLlmConfig(),
+  });
 });
 
 // PUT /api/config/proactive-freq — 更新主动聊天频率 0~1
@@ -292,9 +346,27 @@ router.put('/background-llm-concurrency', (req, res) => {
 });
 
 // PUT /api/config/llm — 更新 LLM 配置
-router.put('/llm', (req, res) => {
-  const { apiKey, baseURL, model, thinkingMode, headers, extraBody } = req.body;
-  const result = updateLlmConfig({ apiKey, baseURL, model, thinkingMode, headers, extraBody });
+// contextWindow 留空（null/''）= 用户没声明 → 走三级回退的上游探测（provider），
+// 取不到用保守默认 128000（default）；探测预算压到 5s，保存动作不能被上游拖住
+const LLM_SAVE_PROBE_TIMEOUT_MS = 5000;
+router.put('/llm', async (req, res) => {
+  const { apiKey, baseURL, model, thinkingMode, headers, extraBody, contextWindow, contextWindowSource } = req.body;
+
+  let resolvedWindow = contextWindow;
+  let resolvedSource = contextWindowSource;
+  if (contextWindow === null || contextWindow === '') {
+    const probe = await resolveDeclaredOrProviderWindow({
+      baseURL: baseURL || config.llm.baseURL,
+      apiKey: apiKey || config.llm.apiKey,
+      headers: headers || config.llm.headers,
+      model: model || config.llm.model,
+      timeoutMs: LLM_SAVE_PROBE_TIMEOUT_MS,
+    });
+    resolvedWindow = probe.contextWindow;
+    resolvedSource = probe.contextWindowSource;
+  }
+
+  const result = updateLlmConfig({ apiKey, baseURL, model, thinkingMode, headers, extraBody, contextWindow: resolvedWindow, contextWindowSource: resolvedSource });
   if (!result.ok) {
     return res.status(400).json(result);
   }
@@ -426,13 +498,34 @@ router.get('/llm/profiles', (req, res) => {
 });
 
 // POST /api/config/llm/profiles — 新增 profile（默认快照当前 LLM 配置，可传字段覆盖）
-router.post('/llm/profiles', (req, res) => {
+// contextWindow 可选：填了按用户声明（declared）；没填则尝试上游 GET /v1/models 的
+// context_length（provider），取不到用保守默认 128000（default）——三级回退见 services/contextUsage.js
+router.post('/llm/profiles', async (req, res) => {
   const { name, ...overrides } = req.body;
   if (!name || !name.trim()) {
     return res.status(400).json({ error: 'name is required' });
   }
-  const result = addLlmProfile(name, overrides);
-  res.json({ ok: true, profiles: getLlmProfiles(), activeProfileId: getActiveProfileId() });
+
+  const baseURL = overrides.baseURL !== undefined ? overrides.baseURL : (config.llm.baseURL || '');
+  const model = overrides.model !== undefined ? overrides.model : (config.llm.model || '');
+  const apiKey = overrides.apiKey !== undefined ? overrides.apiKey : (config.llm.apiKey || '');
+  const headers = overrides.headers !== undefined ? overrides.headers : (config.llm.headers || {});
+  const resolved = await resolveDeclaredOrProviderWindow({
+    declared: overrides.contextWindow,
+    baseURL,
+    apiKey,
+    headers,
+    model,
+  });
+
+  addLlmProfile(name, { ...overrides, contextWindow: resolved.contextWindow, contextWindowSource: resolved.contextWindowSource });
+  res.json({
+    ok: true,
+    profiles: getLlmProfiles(),
+    activeProfileId: getActiveProfileId(),
+    contextWindow: resolved.contextWindow,
+    contextWindowSource: resolved.contextWindowSource,
+  });
 });
 
 // DELETE /api/config/llm/profiles/:id — 删除 profile
